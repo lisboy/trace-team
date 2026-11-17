@@ -160,7 +160,7 @@ export default function SkillsTab() {
           ))}
         </div>
         <div className="mt-2 flex gap-2">
-          <input
+          <input autoComplete="off"
             className="flex-1 border rounded px-2 py-1 text-xs"
             placeholder="添加自定义技能文件夹（绝对路径，里面放 <name>.md 或 <name>/SKILL.md）"
             value={rootInput}
@@ -182,13 +182,13 @@ export default function SkillsTab() {
           </span>
         </div>
         <div className="grid grid-cols-2 gap-2">
-          <input
+          <input autoComplete="off"
             className="border rounded px-2 py-1 text-xs"
             placeholder="技能名（字母/数字/_/-，如 pixel-art）"
             value={nName}
             onChange={(e) => setNName(e.target.value)}
           />
-          <input
+          <input autoComplete="off"
             className="border rounded px-2 py-1 text-xs"
             placeholder="一句话描述（注入给模型的唯一线索，写清楚什么时候用）"
             value={nDesc}

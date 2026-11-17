@@ -32,7 +32,6 @@ from game_agent.agents.tools import ToolContext, ToolError, ToolResult
 from game_agent.agents.tools.native import (
     _BROWSER_KILL_MSG, _browser_global_kill, _dangerous, _effective_whitelist,
     _whitelist_error, cmd_head)
-from game_agent.assets import gpu_arbiter
 from game_agent.config import SHELL_POLICY
 from game_agent.logging_setup import get_logger
 from game_agent.orchestration import envfacts
@@ -142,13 +141,6 @@ async def start_service(args: dict, t: ToolContext) -> str:
     cmd = str(args.get("command") or "").strip()
     if not cmd:
         raise ToolError("缺少 command（例：python -m uvicorn game_agent.main:app --port 8000）")
-    # 配音路由硬规则：语音服务由 generate_audio 内部拉起，不许自己起。
-    # 实测 2026-10-28（run 865be9fd）：用户只说「配音重新生成」，模型 start_service 起了 8860。
-    from game_agent.agents.tools.audio_guard import (
-        AUDIO_ROUTE_DENIED, audio_python_allowed, is_audio_server_command)
-    if not audio_python_allowed(t.run_ctx.user_request) and is_audio_server_command(
-            cmd, int(args.get("port") or 0)):
-        raise ToolError(AUDIO_ROUTE_DENIED)
     # ① 危险动作：与 run_command 同一口径（删盘/格式化/关机/远程执行/强推），与是不是服务无关
     danger = _dangerous(cmd)
     if danger:
@@ -174,13 +166,6 @@ async def start_service(args: dict, t: ToolContext) -> str:
         ready_path = "/" + ready_path
 
     cmd = _fix_python(cmd, t.python_bin)
-    # 组长直启 ComfyUI/IndexTTS2 也要先腾卡：两个本地服务同时驻留 = 显存 OOM，
-    # 而且这时报错只会变成「服务起来了但一调就崩」，排查成本更高。
-    gpu_kind = gpu_arbiter.kind_for_command(cmd)
-    gpu_note = ""
-    if gpu_kind:
-        room = await gpu_arbiter.make_room(gpu_kind)
-        gpu_note = gpu_arbiter.note(room)
     log = _log_path(t.workspace, "svc")
     env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1",
            "PYTHONUNBUFFERED": "1"}
@@ -240,7 +225,7 @@ async def start_service(args: dict, t: ToolContext) -> str:
         "state": "running", "pid": proc.pid, "command": cmd,
         "url": rec["url"], "port": port or None, "log": str(log),
         "hint": "下一步可用 screenshot_page 截图看效果；验收完 stop_service 收掉。"
-                + entry_note + (f"（{gpu_note}）" if gpu_note else ""),
+                + entry_note,
         "log_tail": _tail(log, 20),
     }, ensure_ascii=False)
 

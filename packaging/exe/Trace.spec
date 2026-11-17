@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller 打包配置：把 Trace 打成单文件 Trace.exe（Windows）。
+r"""PyInstaller 打包配置：把 Trace 打成单文件 Trace.exe（Windows）。
 
 用法（仓库根目录，用项目 .venv 里的 python）：
   .venv\Scripts\python.exe -m PyInstaller packaging\exe\Trace.spec --noconfirm
@@ -56,23 +56,28 @@ hiddenimports = [
     "game_agent.llm.anthropic_compat",
     "game_agent.llm.openai_compat",
     "game_agent.api.routers.auth",
+    "game_agent.api.routers.team",
     "game_agent.api.routers.projects",
     "game_agent.api.routers.sessions",
     "game_agent.api.routers.runs",
     "game_agent.api.routers.artifacts",
     "game_agent.api.routers.imagegen",
-    "game_agent.api.routers.voicegen",
-    "game_agent.api.routers.providers",
     "game_agent.api.routers.memory",
     "game_agent.api.routers.config",
     "game_agent.api.routers.skills",
     "game_agent.api.routers.prefs",
     "game_agent.api.routers.questions",
+    "game_agent.api.routers.channels",
     "game_agent.api.routers.system",
+    "game_agent.api.routers.storage",
+    "game_agent.api.routers.doctor",
     "game_agent.api.routers.ws",
     "game_agent.core.lite.container",
     "game_agent.orchestration.orchestrator",
     "game_agent.auth.service",
+    "game_agent.auth.passwords",
+    "game_agent.auth.rbac",
+    "game_agent.api.deps",
     "game_agent.bootstrap",
     "game_agent.db.migrate",
     # 动态 import（字符串引用），静态分析抓不到：run_command 里 grep 命令改写会用

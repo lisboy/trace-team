@@ -994,18 +994,6 @@ async def load_skill(args: dict, t: ToolContext) -> str:
     if len(text) > 12000:
         text = text[:12000] + f"\n...[截断，共 {len(text)} 字符]"
     head = f"[技能 {name} · 来源：{_SKILL_SCOPE_LABELS.get(scope, scope)} · {path.name}]\n\n"
-    # 配音类技能正文里写着 python 管线（cv_gen.py / gen-cv-indextts.py）——
-    # 那是给人/给脚本用的老路。平台规则是「配音一律直接调用 generate_audio」，
-    # 不先把这条压上去，模型读完技能就会照着文档自己去起服务、跑脚本（实测 2026-10-28）。
-    if any(k in text for k in ("cv_gen", "gen-cv-indextts", "IndexTTS", "配音")):
-        head += (
-            "⚠️ 平台调用规则（优先于本技能正文里的命令行）：在 循迹（Trace） 里生成配音一律直接调用 "
-            "**generate_audio** 工具——语音服务由它内部自动拉起，不要自己 "
-            "start_service 起 IndexTTS2、不要跑 cv_gen.py / "
-            "gen-cv-indextts.py / cv-presets.py。需要新音色时给 generate_audio 传 "
-            "design_desc（音色描述）+ preset_name（预设名），它会先造音色再合成。"
-            "本技能里的 python 命令只用于用户明确要求「按之前 python 脚本的方式」时，"
-            "或作为理解数据流/参数口径的参考，不是让你去执行的。\n\n")
     return head + text
 
 
@@ -1262,17 +1250,6 @@ async def run_command(args: dict, t: ToolContext) -> str:
     # ②·二 按进程名全杀浏览器/解释器：会连用户自己的窗口一起关掉（实测踩过）。
     if _browser_global_kill(cmd):
         raise ToolError(_BROWSER_KILL_MSG)
-    # ②·五 配音路由：生成配音一律直接调 generate_audio 工具，不许自己
-    # 起 IndexTTS2 / curl 语音接口 / 跑 cv 脚本。2026-10-28 实测：用户说「配音重新生成」，
-    # 模型 load 了项目技能后就照技能里的 python 管线自己 start_service(8860)、写探针脚本合成，
-    # 全程没调配音工具。例外：用户明确说「按之前 python 脚本的方式」。
-    from game_agent.agents.tools.audio_guard import (
-        AUDIO_ROUTE_DENIED, audio_python_allowed, is_audio_script_command,
-        is_audio_server_command, script_calls_audio)
-    if not audio_python_allowed(t.run_ctx.user_request):
-        if is_audio_server_command(cmd) or is_audio_script_command(cmd) \
-                or script_calls_audio(cmd, t.workspace):
-            raise ToolError(AUDIO_ROUTE_DENIED)
     # ③ bash 习惯就地改写成当前 shell 能跑的写法（/dev/null→2>nul、`;`→&&、`| head -N`→由工具截取…）
     cmd, fix_notes, reject, limit = _autofix_shell(cmd)
     if reject:

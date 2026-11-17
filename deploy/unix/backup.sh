@@ -1,20 +1,7 @@
 #!/usr/bin/env bash
-# deploy/unix/backup.sh —— 每日备份：git bundle（项目工作区）+ 数据库 dump。
-# 配合 cron： 0 3 * * * /path/deploy/unix/backup.sh
-set -e
-cd "$(dirname "$0")/../.."
-BACKUP_DIR="${BACKUP_DIR:-./backups}"
-mkdir -p "$BACKUP_DIR"
-STAMP="$(date +%Y%m%d-%H%M%S)"
-PROJECTS_ROOT="${PROJECTS_ROOT:-$HOME/.trace/projects}"
-
-echo "[backup] bundle 各项目 git 仓库"
-for d in "$PROJECTS_ROOT"/*/; do
-  [ -d "$d/.git" ] || continue
-  name="$(basename "$d")"
-  git -C "$d" bundle create "$BACKUP_DIR/${name}-${STAMP}.bundle" --all
-done
-
-echo "[backup] 数据库快照（SQLite）"
-cp "${DATA_DIR:-$HOME/.trace}/game_agent.db" "$BACKUP_DIR/game_agent-${STAMP}.db" 2>/dev/null || true
-echo "[backup] 完成 -> $BACKUP_DIR"
+# deploy/unix/backup.sh —— 备份已安装的团队版数据（默认 /opt/trace，可用 TRACE_DIR 覆盖）。
+# 数据库走事务一致性快照，不用停服务；详见包内《部署手册.md》。
+set -euo pipefail
+DIR="${TRACE_DIR:-/opt/trace}"
+[ -f "$DIR/scripts/backup.sh" ] || { echo "未找到 $DIR/scripts/backup.sh：请设置 TRACE_DIR 指向安装目录" >&2; exit 1; }
+exec bash "$DIR/scripts/backup.sh" "$@"

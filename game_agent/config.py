@@ -9,13 +9,25 @@ import os
 import sys
 from pathlib import Path
 
+# .env 里写的 GA_DATA_DIR 只是安装脚本记下的「当前数据目录」，不是用户手工钉死：
+# 设置页迁移时要允许并同步改写这一行（见 data_dir_source / rewrite_env_data_dir）。
+# 真正从 shell / systemd 注入的环境变量才拒绝迁移——那个改不了 .env 也没用。
+_ENV_FILE: Path | None = None
+_PRELOAD_DATA_DIR = os.environ.get("GA_DATA_DIR", "")
+
 try:
-    from dotenv import load_dotenv
+    from dotenv import find_dotenv, load_dotenv
 
     if getattr(sys, "frozen", False):
         # 冻结成 exe 后没有 .py 文件，load_dotenv() 默认从当前工作目录找 .env；
         # 明确指向 exe 同目录的 .env，双击启动（工作目录未必是 exe 目录）也能读到配置。
-        load_dotenv(Path(sys.executable).parent / ".env")
+        _env_path: Path | None = Path(sys.executable).parent / ".env"
+    else:
+        _found = find_dotenv(usecwd=True)
+        _env_path = Path(_found) if _found else None
+    if _env_path is not None and _env_path.is_file():
+        load_dotenv(_env_path)
+        _ENV_FILE = _env_path.resolve()
     else:
         load_dotenv()
 except Exception:  # pragma: no cover - 没有 python-dotenv 也能跑（环境变量已注入）
@@ -58,18 +70,22 @@ def _float(key: str, default: float) -> float:
 
 # ---------- 模式 ----------
 MODE: str = _str("GA_MODE", "lite").lower()
+# 注意：server 只保留了分支判断（如 can_reveal / list_dirs 的目录限制），
+# 存储与队列**没有** server 实现——本版本只有 SQLite + core/lite 进程内实现，
+# 设 GA_MODE=server 不会变成分布式部署。
 assert MODE in ("lite", "server"), f"GA_MODE 非法: {MODE}"
 
 # ---------- 数据目录 / 路径 ----------
-# 数据根目录（DB / 日志 / 上传 / 项目工作区都在它下面）。默认在用户主目录的 .trace 下，
-# 但允许用户在「设置 / 存储空间」里改到别的盘（老盘时间久了会占满 C 盘）。
+# 数据根目录（DB / 日志 / 上传 / 项目工作区都在它下面）。团队版默认用 ~/.trace-team，
+# 与个人版的 ~/.trace（指针 ~/.trace_location）完全分开：两者装在同一台机器上时
+# 各自使用各自的库，互不污染。允许用户在「设置 / 存储空间」里改到别的盘。
 #
 # 记忆方式用「指针文件」——因为用户选的目录本身不能用来记住自己（搬走/删掉就丢了），
 # 所以需要一个固定位置的小文件存「当前数据目录在哪」，进程启动时先读它：
-#   ① 用户主目录的 ~/.trace_location（默认/最早的位置，永远可写）；
-#   ② 打包版另外再看 exe 同目录的 .trace_location（便携盘换机也能跟着走）。
+#   ① 用户主目录的 ~/.trace_team_location（默认/最早的位置，永远可写）；
+#   ② 打包版另外再看 exe 同目录的 .trace_team_location（便携盘换机也能跟着走）。
 # 环境变量 GA_DATA_DIR 优先级最高（调试/测试用），显式给了就不再读指针文件。
-_POINTER_FILENAME = ".trace_location"
+_POINTER_FILENAME = ".trace_team_location"
 
 
 def _pointer_files() -> list[Path]:
@@ -118,8 +134,75 @@ def write_data_dir_pointer(new_dir: str) -> None:
             pass
 
 
-_DEFAULT_DATA_DIR = str(Path.home() / ".trace")
-# 优先级：环境变量 > 指针文件 > 默认 ~/.trace
+def env_file_path() -> Path | None:
+    """本次启动实际读到的 .env 路径（没读到则为 None）。"""
+    return _ENV_FILE
+
+
+def _env_file_value(key: str) -> str:
+    """直接读 .env 文件里某个键的值（同键多行时以最后一行生效为准）。"""
+    if _ENV_FILE is None:
+        return ""
+    try:
+        lines = _ENV_FILE.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ""
+    val = ""
+    for line in lines:
+        s = line.strip()
+        if not s or s.startswith("#") or "=" not in s:
+            continue
+        k, v = s.split("=", 1)
+        if k.strip() == key:
+            val = v.strip().strip('"').strip("'")
+    return val
+
+
+def data_dir_source() -> str:
+    """GA_DATA_DIR 的来源：env（真环境变量）| dotenv（.env 文件）| pointer | default。
+
+    设置页据此决定「迁移能不能做」：env 改不动（重启后又被注入）→ 拒绝；
+    dotenv 是安装脚本写的记录 → 允许迁移，迁移成功后同步改写 .env。
+    """
+    cur = _str("GA_DATA_DIR", "")
+    if not cur:
+        return "pointer" if _read_pointer() else "default"
+    if not _PRELOAD_DATA_DIR and _env_file_value("GA_DATA_DIR") == cur:
+        return "dotenv"
+    return "env"
+
+
+def rewrite_env_data_dir(new_dir: str) -> None:
+    """把 .env 里的 GA_DATA_DIR 改成 new_dir（空串=留空，走指针/默认），其余行原样保留。
+
+    迁移成功后才调用；写失败会抛异常，调用方据此回滚（否则下次启动脚本还在老目录起库）。
+    """
+    pf = _ENV_FILE
+    if pf is None or not pf.is_file():
+        raise RuntimeError("找不到 .env 文件，无法同步数据目录")
+    out: list[str] = []
+    done = False
+    for line in pf.read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        key = s.split("=", 1)[0].strip() if "=" in s else ""
+        if not done and s and not s.startswith("#") and key == "GA_DATA_DIR":
+            out.append(f"GA_DATA_DIR={new_dir}")
+            done = True
+        else:
+            out.append(line)
+    if not done:
+        out.append(f"GA_DATA_DIR={new_dir}")
+    tmp = pf.with_name(pf.name + ".tmp")
+    tmp.write_text("\n".join(out) + "\n", encoding="utf-8")
+    try:
+        tmp.chmod(pf.stat().st_mode & 0o777)
+    except OSError:
+        pass
+    tmp.replace(pf)
+
+
+_DEFAULT_DATA_DIR = str(Path.home() / ".trace-team")
+# 优先级：环境变量 > 指针文件 > 默认 ~/.trace-team
 _DATA_DIR_RAW = _str("GA_DATA_DIR", "") or _read_pointer() or _DEFAULT_DATA_DIR
 DATA_DIR = Path(_DATA_DIR_RAW).expanduser().resolve()
 PROJECTS_ROOT = Path(
@@ -146,9 +229,9 @@ PENDING_CLEANUP_FILENAME = ".trace_pending_cleanup"
 def data_dir_env_override() -> str:
     """显式钉死数据目录的环境变量值（空串=没指定）。
 
-    非空时 ``GA_DATA_DIR`` 优先级高于指针文件：设置页「迁移到别处」写的是指针，
-    这种情况下迁移不会生效（重启后还读老目录）。设置页拿它给用户一句实话，
-    迁移接口拿它直接拒绝——否则用户会得到「迁移成功」却什么都没变。
+    非空时 ``GA_DATA_DIR`` 优先级高于指针文件。注意它同样包含 .env 里的值——
+    「能不能迁移」不看这里，看 ``data_dir_source()``：.env 来源可以迁移并改写，
+    真正的环境变量（shell/systemd）才拒绝，否则用户会得到「迁移成功」却什么都没变。
     """
     return _str("GA_DATA_DIR", "")
 
@@ -159,31 +242,33 @@ if not SECRET_KEY and MODE == "lite":
     SECRET_KEY = "dev-insecure-secret-change-me-in-server"
 
 # ---------- 数据库 ----------
-# 个人版只支持 SQLite（单文件、零运维、随包即用）。
-# 留空 → 用 DATA_DIR 下的 game_agent.db；若 .env 里仍写着 MySQL 等非 SQLite 连接串，
-# 直接报错说清楚，而不是启动到一半才在 SQL 方言上炸。
+# 团队版默认 MySQL（Linux 包内置 MariaDB），SQLite 仅留给本机调试与冒烟测试。
+# 留空 → 用 DATA_DIR 下的 game_agent.db（测试/单机试用）；写 mysql:// 或 mariadb://
+# 会自动换成 aiomysql 驱动。
 DATABASE_URL = _str("DATABASE_URL", "")
 REDIS_URL = _str("REDIS_URL", "")
 
 if not DATABASE_URL:
     DB_PATH = DATA_DIR / "game_agent.db"
     DATABASE_URL = f"sqlite+aiosqlite:///{DB_PATH}"
-elif not DATABASE_URL.startswith("sqlite"):
+elif DATABASE_URL.startswith(("mysql://", "mariadb://")):
+    DATABASE_URL = "mysql+aiomysql://" + DATABASE_URL.split("://", 1)[1]
+elif not DATABASE_URL.startswith(("sqlite", "mysql+aiomysql", "mysql+asyncmy")):
     raise RuntimeError(
-        "本版本只支持 SQLite。请把 .env 里的 DATABASE_URL 删除或改为 sqlite+aiosqlite:///<数据库文件路径>；"
+        "DATABASE_URL 只支持 sqlite+aiosqlite:// 或 mysql+aiomysql:// 连接串；"
         f"当前值：{DATABASE_URL}"
     )
 
 # ---------- LLM ----------
-# 只有「真实大模型」一种运行方式：有配置好的供应商档位就走档位，没有就走下面的
-# 全局兜底（.env）。不存在 mock/离线演示模式——"能不能聊"只取决于有没有配供应商。
-OPENAI_API_KEY = _str("OPENAI_API_KEY")
-OPENAI_BASE_URL = _str("OPENAI_BASE_URL", "https://api.openai.com/v1")
+# 只有「真实大模型」一种运行方式：不存在 mock/离线演示模式。
+# 团队版**没有 .env 全局兜底模型**：模型/地址/Key 只能来自管理员绑定的「模型档位」
+# （项目绑定 → 团队默认档位 → 角色绑定）。没绑定时 run 直接失败并提示去绑定，
+# 绝不悄悄用环境变量里的旧 Key/旧端点（那会让「界面显示已接通、实际 403」永远查不出来）。
+# LLM_MODEL 只是档位缺模型名时的显示/兜底标签，不参与任何端点选择。
 LLM_MODEL = _str("GA_LLM_MODEL", "gpt-4o-mini")
 # 调用失败重试（429/5xx/超时/网络错误）：指数退避，遵循 Retry-After
-LLM_MAX_ATTEMPTS = 5                             # 单次对话请求的最大尝试次数（含首次），达标即放弃
-# 额外重试次数（总尝试 = 1 + N），默认 4 → 共 5 次；环境变量调大也会被 LLM_MAX_ATTEMPTS 夹住
-LLM_RETRIES = max(0, min(_int("GA_LLM_RETRIES", LLM_MAX_ATTEMPTS - 1), LLM_MAX_ATTEMPTS - 1))
+# 尝试次数固定为 5（含首次），不支持用环境变量调整：GA_LLM_RETRIES 曾是死配置，已删除。
+LLM_MAX_ATTEMPTS = 5
 LLM_CALL_TIMEOUT_S = _int("GA_LLM_CALL_TIMEOUT_S", 360)  # 单次 LLM 调用硬上限（防网关挂起卡死 run）
 LLM_RETRY_BASE_S = float(_str("GA_LLM_RETRY_BASE_S", "1.5") or 1.5)
 # 建连超时（只等 TCP+TLS 握手，不覆盖模型出字时间）：默认 8s。
@@ -291,153 +376,9 @@ for pair in _ROLE_MODELS_RAW.split(","):
 # 保留占位是为了「不要因为 .env 里还留着旧键就报错」——旧的 GA_AUTH_MODE 一律忽略。
 PLACEHOLDER_ENABLED = _bool("PLACEHOLDER_ENABLED", True)
 
-# ---------- 图像生成（ComfyUI 本地） ----------
-COMFYUI_BASE_URL = _str("COMFYUI_BASE_URL")           # 空 = 未启用，图像走占位
-COMFYUI_CHECKPOINT = _str("COMFYUI_CHECKPOINT")       # 留空自动选第一个可用模型
-# text_encoders 里选哪个文本编码器（DiT 三件套）。留空自动：优先 8b（qwen_image_2.1 的
-# 4096 维对应 Qwen3-VL-8B）。必须钉死——「取第一个含 qwen 的文件」会误选给 MiniMax-H3/
-# ClipProj 用的 qwen3vl_4b（2560 维），与扩散模型 4096 维不匹配，KSampler 直接报
-# "normalized_shape=[4096] ... got [1,N,2560]"（2026-11-05 踩坑）。
-COMFYUI_CLIP = _str("COMFYUI_CLIP")
-# 反向提示词：出图默认负面词（工作台「恢复默认负面词」与 .env 未覆盖时都用它）。
-# 采用带权重的分组写法：画质/解剖/手部/脸部按重要程度加权重（1.2~1.4），
-# 其余为常规排除项（文字、水印、过曝、NSFW 等）。可用 .env COMFYUI_NEGATIVE_PROMPT 覆盖。
-COMFYUI_NEGATIVE_PROMPT = _str(
-    "COMFYUI_NEGATIVE_PROMPT",
-    "(worst quality, low quality, normal quality:1.4), "
-    "(bad anatomy, deformed, mutated, disfigured:1.3), "
-    "(bad hands, missing fingers, extra fingers, fused fingers, poorly drawn hands, "
-    "malformed limbs, extra limbs, missing limbs:1.4), "
-    "(distorted face, deformed face, asymmetrical eyes:1.2), "
-    "lowres, blurry, jpeg artifacts, text, watermark, signature, username, error, ugly, "
-    "bad proportions, unnatural pose, overexposed, washed out, over-saturated, nsfw",
-)
-# 自定义 API 格式工作流 JSON（ComfyUI 界面 Save (API Format) 导出），空 = 内置 SD 默认工作流
-COMFYUI_WORKFLOW_PATH = _str("COMFYUI_WORKFLOW_PATH")
-# 美术派发/素材重画走哪条工作流：auto=按模型探测（checkpoints 里有 ckpt 就优先经典 SD），
-# checkpoint=强制经典 SD，diffusion=强制 DiT 三件套（Qwen/Anima）。非法值按 auto 处理。
-# 实测：本机 checkpoints 目录躺着 6.9G 的 SDXL，auto 永远选不到 DiT，要全批走 Qwen 只能显式指定。
-COMFYUI_WORKFLOW_MODE = _str("COMFYUI_WORKFLOW_MODE", "auto")
-# 默认风格 LoRA（models/loras 下的相对路径，空 = 不挂）。用于把出图拉向某个统一画风，
-# 支持子目录（如 qwen21_style/xxx.safetensors）。强度 0~1.5，Qwen-Image 实测 0.7~0.9 合适。
-COMFYUI_LORA = _str("COMFYUI_LORA")
-COMFYUI_LORA_STRENGTH = _float("COMFYUI_LORA_STRENGTH", 0.8)
-# LoRA 安装目录（工作台「上传 LoRA」写到这）：空 = 从 COMFYUI_LAUNCH_CMD 里的 main.py 反推
-# <ComfyUI>/models/loras；仍解析不到就禁止上传（列表照常从 ComfyUI /object_info 读）。
-COMFYUI_LORAS_DIR = _str("COMFYUI_LORAS_DIR")
-COMFYUI_IMG2IMG_DENOISE = _float("COMFYUI_IMG2IMG_DENOISE", 0.42)
-# ---------- 高分辨率出图（大图 / 超原生分辨率） ----------
-# ComfyUI 本身不限分辨率，真正的门槛是 8G 显存：SDXL/Qwen 原生画幅只有 ~1MP，
-# 直接按 3~4MP 出图能出（实测 2360x1640≈3.87MP、qwen_image_2.1 int8 + LoRA、20 步、
-# tiled 解码，8G 卡约 5 分钟成功），但再往上（4K≈8MP）会 OOM 或把 GPU 拖死。
-# 策略：目标像素 ≤ 此阈值 → 直接按目标分辨率采样（全画质）；超过 → 先按阈值内
-# 的基准分辨率采样，再 Lanczos 放大到目标尺寸（快但不增细节）。
-COMFYUI_DIRECT_MAX_MP = _float("COMFYUI_DIRECT_MAX_MP", 4.0)
-# 大图 VAE 解码用分块（tiled）而非一次性解码，显著降低解码阶段的显存峰值（8G 必开）。
-COMFYUI_VAE_TILE = _int("COMFYUI_VAE_TILE", 512)
-COMFYUI_VAE_TILE_OVERLAP = _int("COMFYUI_VAE_TILE_OVERLAP", 64)
-# 需要分块解码 / 触发基准采样的像素阈值（百万像素）。低于此值仍走原样一次性解码，行为不变。
-COMFYUI_TILED_MP = _float("COMFYUI_TILED_MP", 1.6)
-# 单张出图等待上限（含排队/加载模型）。1792x1024 + LoRA 实测 220~300s，
-# 300s 卡在尾巴上会随机判超时（批量里一张图连超 3 次烧 15 分钟），留足余量。
-COMFYUI_TIMEOUT_S = _int("COMFYUI_TIMEOUT_S", 600)
-# ComfyUI「启动」等待上限（不是出图）：首次/久未运行（冷启动）要扫模型、解包前端、
-# JIT 编译内核，几分钟很常见；固定 180s 常在尾巴判死 → 整批图回退占位。
-# 冷启动给 COMFYUI_BOOT_TIMEOUT_S；热启动用较短值（内部取 min(此值,240)）。
-COMFYUI_BOOT_TIMEOUT_S = _int("COMFYUI_BOOT_TIMEOUT_S", 600)
-# 启动期间「多久没有新日志算异常」——只用于记录告警，不打断等待（加载模型本来就长时间无输出）
-COMFYUI_BOOT_STALL_S = _int("COMFYUI_BOOT_STALL_S", 180)
-# 启动硬上限：进程还活着时最多等这么久，超过一定判失败（防真正卡死的进程被无限等）
-COMFYUI_BOOT_HARD_CAP_S = _int("COMFYUI_BOOT_HARD_CAP_S", 900)
-# ComfyUI 未运行时自动启动：启动命令（exe 路径），空 = 探测常见安装位置；GA_COMFYUI_AUTOSTART=false 关闭
-COMFYUI_LAUNCH_CMD = _str("COMFYUI_LAUNCH_CMD")
-COMFYUI_AUTOSTART = _str("GA_COMFYUI_AUTOSTART", "true").lower() not in ("false", "0", "no")
-
-# ---------- 视频生成（ComfyUI 本地 Wan2.2 TI2V 5B） ----------
-# 8GB 单卡只能跑 5B（14B/28B 权重放不下），这里固定一套 Wan2.2 TI2V 5B 三件套工作流。
-# 模型名对应 ComfyUI models/ 下的相对文件名；换模型改这里即可。
-COMFYUI_VIDEO_UNET = _str("COMFYUI_VIDEO_UNET", "wan2.2_ti2v_5B_fp16.safetensors")
-COMFYUI_VIDEO_CLIP = _str("COMFYUI_VIDEO_CLIP", "umt5_xxl_fp8_e4m3fn_scaled.safetensors")
-COMFYUI_VIDEO_VAE = _str("COMFYUI_VIDEO_VAE", "wan2.2_vae.safetensors")
-# 默认出片尺寸/帧数/帧率：8GB 显存用 832x480 + 49 帧（≈2s@24fps）最稳；调大先小步试。
-# ⚠️ Wan2.2 TI2V 5B 是**原生 24fps / 720P** 的模型（官方模板 121 帧按 24fps 播放）；
-#    以前按 16fps 出片会让动作发顿，再靠插值硬补到 60 会放大伪影——现在按原生 24fps 出。
-#    帧数仍必须是 4n+1（17/33/49/81…）。
-COMFYUI_VIDEO_WIDTH = _int("COMFYUI_VIDEO_WIDTH", 832)
-COMFYUI_VIDEO_HEIGHT = _int("COMFYUI_VIDEO_HEIGHT", 480)
-COMFYUI_VIDEO_LENGTH = _int("COMFYUI_VIDEO_LENGTH", 49)
-COMFYUI_VIDEO_FPS = _int("COMFYUI_VIDEO_FPS", 24)
-# 采样：uni_pc + simple。cfg 取 4.0（Wan 默认 5.0 偏高，白色/浅色人物在漫剧里容易过曝发白脸）；
-# 降一点更稳、更少过曝，仍能守住提示词。steps 保持 20 兼顾出片质量与 8G 速度。
-COMFYUI_VIDEO_STEPS = _int("COMFYUI_VIDEO_STEPS", 20)
-COMFYUI_VIDEO_CFG = _float("COMFYUI_VIDEO_CFG", 3.0)
-# 视频专用反向提示词（与出图的分开，避免把「3d/景深/虚化」写进出图，出图有时确实要 3D/景深）。
-# 重点：① 防变脸、防割裂/闪烁；② 防把 2D 立绘画成 3D 塑料手办；③ 防背景被脑补成深色/墨绿/模糊光斑。
-COMFYUI_VIDEO_NEGATIVE_PROMPT = _str(
-    "COMFYUI_VIDEO_NEGATIVE_PROMPT",
-    "text, watermark, lowres, worst quality, low quality, blurry, jpeg artifacts, "
-    "overexposed, blown out highlights, overbright, washed out, white face, glowing face, "
-    "distorted face, deformed face, inconsistent character face, mutated face, "
-    "extra limbs, bad anatomy, frame flicker, flickering, color flicker, "
-    "temporal inconsistency, warp, tearing, screen tearing, glitch, "
-    "morphing, sudden large motion, chaotic motion, camera shake, "
-    "3d, 3d render, cgi, cg render, plastic, doll, figurine, toy, oversharpened, "
-    "depth of field, bokeh, blurred background, dark background, green screen, color shift, "
-    "背景突变, 静帧, 画面割裂, 人脸扭曲, 变脸, 五官错位, 闪白, 过曝, 闪烁, 撕裂, "
-    "三维, 塑料感, 人偶, 手办, 深色背景",
-)
-# i2v 参考图透明底合成色：透明底 PNG 在 ComfyUI LoadImage 会丢 alpha 变纯黑（已实测），
-# 后端会先合成到此颜色再上传。取中性浅灰既能和白裙拉开边界，又不会像纯白那样把浅色人物烧白。
-COMFYUI_VIDEO_REF_BG = _str("COMFYUI_VIDEO_REF_BG", "#ebebe7")
-# 出片后补帧：Wan 原生 24fps → 用 ffmpeg 运动补偿补到 60fps 顺滑播放（纯 CPU、不占 GPU）。
-# 失败自动保留原片、不阻断出片。想关掉把 COMFYUI_VIDEO_SMOOTH=false。
-COMFYUI_VIDEO_SMOOTH = _bool("COMFYUI_VIDEO_SMOOTH", True)
-COMFYUI_VIDEO_SMOOTH_FPS = _int("COMFYUI_VIDEO_SMOOTH_FPS", 60)
-# 时间域降噪（防漫剧画面割裂/闪烁）：在补帧前用 ffmpeg hqdn3d 做很轻的时间+空间降噪。
-# 强度 0=关；越大越平滑但会把漫画锐利线条糊掉，建议 0.15–0.25 档（这里用 light 预设）。
-COMFYUI_VIDEO_TEMPORAL_DENOISE = _bool("COMFYUI_VIDEO_TEMPORAL_DENOISE", True)
-# 单条视频等待上限（含排队/冷启动加载模型）。5B 在 3060Ti 上一条约 2–5 分钟，留足余量。
-COMFYUI_VIDEO_TIMEOUT_S = _int("COMFYUI_VIDEO_TIMEOUT_S", 1800)
-
 # 首启后是否把 examples/cardgame 拷成示例工作区（并登记为项目）。
 # 这个版本没有账号概念：「播种」只播示例项目，不再造 demo 账号/密码。
 SEED_DEMO = _bool("GA_SEED_DEMO", False)
-
-# ---------- 语音合成（IndexTTS2 本地服务，配音 / 语音工作台 / 对话朗读） ----------
-# 空 = 未启用：配音工具回退占位静音 wav，语音工作台显示"未连接"
-TTS_BASE_URL = _str("TTS_BASE_URL")
-# 默认音色：优先用预设名（IndexTTS2 服务端预设），否则用参考音频文件路径
-TTS_PRESET = _str("TTS_PRESET")
-TTS_REF_AUDIO = _str("TTS_REF_AUDIO")
-# 情绪：0=同参考 1=情感音频 2=八维向量 3=情感描述文本
-#   只给音色参考音频而不指定情绪时，模型会用平静语气（听感"三句一个调"的根因）
-TTS_EMO_MODE = _str("TTS_EMO_MODE", "0")
-TTS_EMO_TEXT = _str("TTS_EMO_TEXT")
-TTS_EMO_WEIGHT = float(_str("TTS_EMO_WEIGHT", "0.65") or 0.65)
-# 八维情感权重（高兴,愤怒,悲伤,害怕,厌恶,忧郁,惊讶,平静），逗号分隔；配置即用 mode=2
-TTS_EMO_VECTOR = _str("TTS_EMO_VECTOR")
-# 情感参考音频文件路径（一段带目标情绪的干声；配置即用 mode=1）
-TTS_EMO_AUDIO = _str("TTS_EMO_AUDIO")
-# 语速 0.5~2.0（>1 慢 <1 快；IndexTTS-2.5 的 duration_factor，2.0 服务自动忽略）
-TTS_SPEED = float(_str("TTS_SPEED", "1.0") or 1.0)
-# 语言 auto/zh/en/ja/es/ar（auto=服务端按台词判定；IndexTTS-2.5 才生效）
-TTS_LANG = _str("TTS_LANG", "auto")
-# 单次合成等待上限：8G 单卡串行，首次含 30~60 秒模型加载，别设太小
-TTS_TIMEOUT_S = _int("TTS_TIMEOUT_S", 600)# 是否在界面暴露「音色设计」（文字描述造音色，需 IndexTTS2 侧装好 VoxCPM2）
-TTS_VOICE_DESIGN = _str("GA_TTS_VOICE_DESIGN", "true").lower() not in ("false", "0", "no")
-# 语音服务未运行时自动拉起（合成/音色设计前检查，未就绪则等待）
-TTS_AUTOSTART = _str("GA_TTS_AUTOSTART", "true").lower() not in ("false", "0", "no")
-# IndexTTS2 分发目录：含 runtime\python.exe 与 server.py（2.5 平滑升级版）
-TTS_HOME = _str("TTS_HOME", r"D:\AI\IndexTTS-2.5-v3")
-# 自定义启动命令（留空自动用 TTS_HOME\runtime\python.exe -u server.py --port <端口>）
-TTS_LAUNCH_CMD = _str("TTS_LAUNCH_CMD")
-
-# ---------- GPU 互斥（本地生图 ComfyUI ↔ 本地语音 IndexTTS2 共用一块显卡） ----------
-# 一张卡扛不住两个模型同时驻留：出图前先停语音服务、出音前先停生图服务，
-# 等对方进程真正退出（端口释放）再拉起自己。同一进程内全局串行，并发生成会排队。
-GPU_EXCLUSIVE = _str("GA_GPU_EXCLUSIVE", "true").lower() not in ("false", "0", "no")
-# 停掉对方服务后，最多等多少秒让显存真正释放（等端口关闭）
-GPU_STOP_TIMEOUT_S = _int("GA_GPU_STOP_TIMEOUT_S", 45)
 
 # ---------- 服务 ----------
 HOST = _str("GA_HOST", "127.0.0.1")
@@ -450,12 +391,17 @@ PORT = _int("GA_PORT", 18888)
 # 打开后本进程不写 pid 文件、不做启动僵尸清理、不起 worker 池（只提供 API + 静态页），
 # 避免把主实例正在执行的 run 误标成「服务重启中断」，也避免两个进程抢同一个队列。
 DEBUG_INSTANCE = _bool("GA_DEBUG_INSTANCE", False)
+# 逃生开关：明知这套数据目录已有实例在跑，还是强行再起一个。
+# 默认（False）时启动守卫会拦下并退出——因为第二个实例会跑「僵尸 run 清理」，把第一个
+# 实例里正在跑的 run 全标成「服务重启，本次执行被中断」（2026-11-17 用户实测的
+# 「老是重启、我的活被中断」）。放行的实例同样不做僵尸清理，见 core/instance_lock.py。
+ALLOW_MULTI_INSTANCE = _bool("GA_ALLOW_MULTI_INSTANCE", False)
 
 # ---------- 运行约束（设计 §6 / §7）----------
 # 一次任务跑多久、调多少次工具都没有上限。这条只是「判死线」：某个 run 连续这么久
 # 一个事件都没落（LLM 往返/工具调用/批量进度都会落事件），说明 worker 已经死了或
 # 永久挂在外部调用上，界面不该一直挂「运行中」。30 分钟远大于任何单个正常步骤
-# （单次 LLM 360s / 单张出图 300s / 单条 TTS 600s / 单条命令 300s）。
+# （单次 LLM 往返 / 单条命令 / 一次仓库同步都在几分钟内）。
 RUN_STALE_S = _int("GA_RUN_STALE_S", 1800)
 # 用户点了「停止」（runs.cancel_requested=1）后，最多再等这么久还没落终态，就由看门狗
 # 强制把 run 落成 cancelled。正常的取消是秒级的（取消看门狗 task.cancel() 会立刻掀翻
@@ -492,10 +438,13 @@ AUTO_CONTINUE_MAX = _int("GA_AUTO_CONTINUE_MAX", 2)
 # 能跑几分钟，界面上一直挂「执行中…」，用户只能看着卡住。构建/测试需要 300s，扫描不需要：
 # 扫这么久通常说明扫的范围不对，早点掐断 + 引导去用会剪枝的内置 grep/glob/list_dir 更划算。
 SEARCH_TIMEOUT_S = max(10, min(_int("GA_SEARCH_TIMEOUT_S", 60), TOOL_TIMEOUT_S))
-CMD_IDLE_TIMEOUT_S = _int("GA_CMD_IDLE_TIMEOUT_S", 120)
-MAX_TEST_ROUNDS = _int("GA_MAX_TEST_ROUNDS", 3)      # 测试回环上限
-EVENT_MAXLEN = _int("GA_EVENT_MAXLEN", 5000)
-BRANCH_TTL_DAYS = _int("GA_BRANCH_TTL_DAYS", 30)
+# 单个子agent 的挂钟上限（秒）：spawn_agents 派出的子agent 超过这个时间还没交结论，
+# 取消看门狗直接掐掉它，并把「超时未完成」如实回给主agent。为什么必须有：子agent 卡在
+# 一次长工具调用/长思考里时没有任何上限，整批永远收不回来，界面就一直停在
+# 「还有 N 个子agent 在后台跑」（2026-11-15 用户实测）。只掐这一条子任务，不连带整轮。
+# 0 = 不限。
+SUBAGENT_TIMEOUT_S = _int("GA_SUBAGENT_TIMEOUT_S", 600)
+
 
 # 写工具受限目录（设计 §7.3.1）
 PROTECTED_PREFIXES = (".venv", "venv", "__pycache__", ".git", ".trace/events")
@@ -511,7 +460,7 @@ SHELL_NAME = "cmd.exe" if PLATFORM == "windows" else "/bin/sh"
 # 两边都该有的：解释器 / 包管理 / 版本控制 / 回显 / 媒体转换（游戏项目要压视频、抽帧、转音频）
 _COMMON_COMMANDS = [
     "python", "python3", "py", "pytest", "compileall", "ruff", "pip",
-    "git", "npm", "npx", "node", "echo", "ffmpeg", "ffprobe",
+    "git", "svn", "npm", "npx", "node", "echo", "ffmpeg", "ffprobe",
 ]
 # Windows（cmd.exe）——含常用只读查看/比较类内置命令（fc、comp、tree、attrib、ipconfig…），
 # 这些以前全不在名单里，模型一猜就是「命令不在白名单：fc」，白烧一轮。
@@ -659,3 +608,7 @@ def default_python_bin() -> str:
 
 def is_sqlite() -> bool:
     return DATABASE_URL.startswith("sqlite")
+
+
+def is_mysql() -> bool:
+    return DATABASE_URL.startswith(("mysql+aiomysql", "mysql+asyncmy"))

@@ -1,16 +1,14 @@
 import { useEffect, useState } from "react";
 import { usePolicy, type GuidanceItem } from "../assistantPolicy";
-import type { PermissionScope } from "../types";
 
 /**
  * 设置 → 助手行为
- * 1) 新会话默认权限：仅工作区 / 全部权限。已存在的会话各自保留自己的选择。
+ * 1) 权限固定「仅工作区」（团队版不给选项，后端同样强制）。
  * 2) 指导项：给模型看的操作要点（如：jar 包里的源码要先解压查看）。
  *    内置若干默认项，可停用/编辑；也能新增自己的条目。
  */
 export default function AssistantTab() {
-  const { permission_scope, guidance, defaults, loaded, load, save } = usePolicy();
-  const [scope, setScope] = useState<PermissionScope>(permission_scope);
+  const { guidance, defaults, loaded, load, save } = usePolicy();
   const [items, setItems] = useState<GuidanceItem[]>(guidance);
   const [dirty, setDirty] = useState(false);
   const [msg, setMsg] = useState("");
@@ -22,13 +20,11 @@ export default function AssistantTab() {
   }, [loaded, load]);
 
   useEffect(() => {
-    setScope(permission_scope);
     setItems(guidance);
     setDirty(false);
-  }, [permission_scope, guidance]);
+  }, [guidance]);
 
-  function patch(k: Partial<{ scope: PermissionScope; items: GuidanceItem[] }>) {
-    if (k.scope !== undefined) setScope(k.scope);
+  function patch(k: Partial<{ items: GuidanceItem[] }>) {
     if (k.items !== undefined) setItems(k.items);
     setDirty(true);
     setMsg("");
@@ -61,11 +57,9 @@ export default function AssistantTab() {
       const clean = items
         .map((it) => ({ ...it, title: it.title.trim(), text: it.text.trim() }))
         .filter((it) => it.text);
-      await save({ permission_scope: scope, guidance: clean });
-      setMsg("已保存：新会话按此默认权限创建，指导项从下一轮开始生效");
+      await save({ guidance: clean });
+      setMsg("已保存：指导项从下一轮开始生效");
       setDirty(false);
-      // 让已打开的输入框草稿立刻跟上新的默认权限
-      window.dispatchEvent(new Event("ga-policy-changed"));
     } catch (e: any) {
       setErr(e?.message || "保存失败");
     } finally {
@@ -76,36 +70,10 @@ export default function AssistantTab() {
   return (
     <div className="space-y-4 max-w-3xl">
       <div className="bg-white rounded border border-slate-200 p-4">
-        <div className="text-sm font-medium mb-1">新会话默认权限</div>
-        <div className="text-[11px] text-slate-500 mb-3">
-          每个会话都可以在输入框旁「运行选项」里单独改，这里只决定新建会话时的初始值。
-        </div>
-        <div className="space-y-2">
-          <label className="flex items-start gap-2 p-2.5 rounded border border-slate-200 cursor-pointer hover:bg-slate-50">
-            <input type="radio" className="mt-1" name="def-scope"
-              checked={scope === "workspace"} onChange={() => patch({ scope: "workspace" })} />
-            <span>
-              <span className="text-sm font-medium">仅工作区（推荐）</span>
-              <span className="block text-[11.5px] text-slate-500 leading-relaxed">
-                文件工具只能读写/解析当前项目工作区内的内容，越界会被拦下并提示切换权限。
-                适合绝大多数开发任务——改动范围可预期，误删误改风险最低。
-              </span>
-            </span>
-          </label>
-          <label className="flex items-start gap-2 p-2.5 rounded border border-slate-200 cursor-pointer hover:bg-slate-50">
-            <input type="radio" className="mt-1" name="def-scope"
-              checked={scope === "full"} onChange={() => patch({ scope: "full" })} />
-            <span>
-              <span className="text-sm font-medium flex items-center gap-1.5">
-                全部权限
-                <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-50 text-amber-700">风险更高</span>
-              </span>
-              <span className="block text-[11.5px] text-slate-500 leading-relaxed">
-                允许访问工作区以外的本机文件（项目外脚本、依赖目录、外部配置）。盘符根、
-                Windows / Program Files 等系统关键目录仍受保护。适合任务本就跨目录的场景。
-              </span>
-            </span>
-          </label>
+        <div className="text-sm font-medium mb-1">权限范围：仅工作区</div>
+        <div className="text-[11.5px] text-slate-500 leading-relaxed">
+          团队版固定为「仅工作区」：文件工具只能读写/解析当前项目工作区内的内容，
+          越界会被拦下。这样每个成员能改到的范围可预期，也不会碰到别的项目或本机其它目录。
         </div>
       </div>
 
@@ -130,13 +98,13 @@ export default function AssistantTab() {
             return (
               <div key={it.id} className="rounded border border-slate-200 p-2.5">
                 <div className="flex items-center gap-2 mb-1.5">
-                  <input
+                  <input autoComplete="off"
                     type="checkbox"
                     checked={it.enabled}
                     onChange={(e) => setItem(it.id, { enabled: e.target.checked })}
                     title="停用后不再注入系统提示"
                   />
-                  <input
+                  <input autoComplete="off"
                     className="flex-1 text-[12.5px] font-medium border border-slate-200 rounded px-2 py-1"
                     value={it.title}
                     placeholder="标题（如：jar 包先解压）"

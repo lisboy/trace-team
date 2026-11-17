@@ -59,8 +59,6 @@ CHANNELS: dict[str, dict[str, Any]] = {
     },
 }
 
-_MASK = "******"
-
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -76,6 +74,15 @@ def _uuid_or_none(v):  # type: ignore[no-untyped-def]
         return uuid.UUID(str(v))
     except (ValueError, AttributeError, TypeError):
         return None
+
+
+def _hex_id(v) -> str:  # type: ignore[no-untyped-def]
+    """UUID/字符串统一成 32 位十六进制，用于比较「是不是同一个项目」。"""
+    if v is None:
+        return ""
+    if isinstance(v, uuid.UUID):
+        return v.hex
+    return str(v).replace("-", "").lower()
 
 
 def channel_meta(key: str) -> dict[str, Any]:
@@ -94,19 +101,30 @@ def all_channels() -> list[dict[str, Any]]:
 async def upsert_link(sf: async_sessionmaker, *, team_id, user_id, channel: str,
                       external_id: str, display_name: str | None = None,
                       credentials: dict | None = None,
-                      default_project_id=None, inbound_enabled: bool | None = None) -> ChannelLink:
-    """建立/更新绑定。同一 (channel, external_id) 全局唯一：换人绑定时旧绑定置 revoked，
-    避免「同一个人被两个账号同时推送」。"""
+                      default_project_id=None, inbound_enabled: bool | None = None,
+                      project_id=None) -> ChannelLink:
+    """建立/更新绑定。同一 (channel, external_id) 全局唯一。
+
+    绑定按项目分组：project_id 相同才算「同一个绑定」，换人绑定复用同一行；
+    该标识已被别的项目占用时直接报错，不能把别人项目的提醒改道（群消息会发错地方）。
+    不带 project_id 的老接口仍按「团队级」处理，留作未配置项目通道时的兜底。
+    """
     if channel not in CHANNELS:
         raise ValueError(f"未知通道：{channel}")
+    pid_hex = _hex_id(project_id)
     async with sf() as s:
         # (channel, external_id) 有唯一约束，所以「同一标识只能有一行」：
         # 换人绑定时不能新建行（会撞唯一约束），而是把已有行改归当前用户。
         others = (await s.execute(select(ChannelLink).where(
             ChannelLink.channel == channel,
             ChannelLink.external_id == external_id))).scalars().all()
-        link = next((o for o in others if str(o.user_id) == str(user_id)), None)
+        same_scope = [o for o in others if _hex_id(o.project_id) == pid_hex]
+        link = next((o for o in same_scope if str(o.user_id) == str(user_id)), None)
+        if link is None and same_scope:
+            link = same_scope[0]
         if link is None and others:
+            if project_id is not None:
+                raise ValueError("该标识已被其它项目或团队级绑定占用，请换一个外部标识")
             link = others[0]
             link.user_id = _uuid_or_none(user_id) or link.user_id
             link.team_id = _uuid_or_none(team_id) or link.team_id
@@ -120,6 +138,8 @@ async def upsert_link(sf: async_sessionmaker, *, team_id, user_id, channel: str,
             link = ChannelLink(team_id=team_id, user_id=user_id, channel=channel,
                                external_id=external_id)
             s.add(link)
+        if project_id is not None:
+            link.project_id = _uuid_or_none(project_id)
         link.display_name = display_name or link.display_name
         link.status = "active"
         link.unlinked_at = None
@@ -433,14 +453,21 @@ async def compose_run_notice(sf: async_sessionmaker, run_id: str, status: str,
 
 async def notify_run_finished(sf: async_sessionmaker, *, run_id: str, team_id, status: str,
                               session_id: str | None = None,
-                              app_cfg: dict | None = None) -> list[ChannelMessage]:
-    """run 收尾时统一入口：给该团队下所有 active 且开启对应开关的绑定发通知。
+                              app_cfg: dict | None = None,
+                              project_id=None) -> list[ChannelMessage]:
+    """run 收尾时统一入口：给「该项目」下所有 active 且开启对应开关的绑定发通知。
 
-    绝不抛异常——调用点在编排器收尾路径上，推送失败不能改写 run 状态。
+    通道按项目配置：优先只推该项目的绑定；该项目还没配通道时退回团队级（无 project_id）
+    的历史绑定，避免升级后提醒突然全断。绝不抛异常——调用点在编排器收尾路径上，
+    推送失败不能改写 run 状态。
     """
     try:
         kind, title, base_body = await compose_run_notice(sf, run_id, status, session_id)
         links = await active_links(sf, team_id)
+        if project_id is not None:
+            pid_hex = _hex_id(project_id)
+            scoped = [l for l in links if _hex_id(l.project_id) == pid_hex]
+            links = scoped or [l for l in links if l.project_id is None]
         out: list[ChannelMessage] = []
         for link in links:
             if kind == "done" and not link.notify_done:
@@ -463,8 +490,3 @@ async def notify_run_finished(sf: async_sessionmaker, *, run_id: str, team_id, s
         log.exception("notify_run_finished failed")
         return []
 
-
-def mask_secret(v: str | None) -> str:
-    if not v:
-        return ""
-    return _MASK

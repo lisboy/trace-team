@@ -30,7 +30,6 @@ def _runtime_stub() -> AgentRuntime:
     """不跑 __init__（会构建真实 LLM），只测纯记账/文案方法。"""
     rt = AgentRuntime.__new__(AgentRuntime)
     rt._trace_files = {}
-    rt._trace_assets = []
     rt._trace_commands = 0
     rt._trace_screens = 0
     rt._trace_tool_counts = {}
@@ -79,15 +78,6 @@ def test_trace_ignores_failed_tool_calls() -> None:
     rt = _runtime_stub()
     rt._note_trace("edit_file", {"path": "web/style.css"}, "工具错误：未读不许写")
     assert rt._trace_files == {}
-
-
-def test_asset_trace_lists_generated_media() -> None:
-    rt = _runtime_stub()
-    rt._note_trace("generate_image", {"slug": "hero_banner"}, "已生成占位图：assets/hero_banner.png")
-    text, fallback = rt._final_text("")
-    assert fallback is True
-    assert "生成素材 1 个" in text
-    assert "hero_banner" in text
 
 
 def test_empty_nudge_budget_is_reset_per_progress_segment() -> None:

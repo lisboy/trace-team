@@ -3,7 +3,6 @@
 两类：
 - 原生 fs/shell（read/write/edit/list/glob/grep/run_command）
 - 服务与验收（start_service/stop_service/service_logs/screenshot_page）
-- 媒体直连（generate_image/generate_audio）——会话模型直接生成图/音频
 
 工具实现层硬校验（不靠 prompt）：白名单、未读不许写、精确替换、路径前缀、fencing。
 """
@@ -60,9 +59,8 @@ class ToolContext:
     permission_scope: str = "workspace"
     # load_skill 的搜索根（project → global → 用户自定义，按优先级排序），run_agent 注入
     skill_roots: list[tuple[str, Path]] = field(default_factory=list)
-    # 「活进展」计数：批量出图/配音每出完一张(条)就 +1。execute_tool_with_timeout 用它
-    # 区分「整批跑很久但一直在出东西」和「真的卡死」——只看总时长会把 11 张各 1-2 分钟
-    # 的正常批量误判成超时（实测：正确一张张出图，到第 900s 被整批中止）。
+    # 「活进展」计数：长任务每完成一个子项就 +1。execute_tool_with_timeout 用它
+    # 区分「整批跑很久但一直在出东西」和「真的卡死」——只看总时长会把正常的长任务误判成超时。
     progress_seq: int = 0
     # spawn_agents 的后台批次（SpawnBatch）：派发即返回，运行时每轮开头把已回收批次的
     # 结论注入对话；主agent 退出时未回收的批次由 orchestrator 统一取消。

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api";
 import { useAuth } from "../store";
+import SearchSelect from "./SearchSelect";
 
 /** 通道能力档位（与后端 CHANNELS 对齐；后端返回为准，这里只做兜底文案） */
 type ChannelMeta = {
@@ -51,15 +52,14 @@ const KIND_LABEL: Record<string, string> = {
   done: "任务完成", question: "待你回答", failed: "任务失败", test: "通道自检",
 };
 
-/** 「消息通道」设置页：把任务完成提醒推到钉钉 / 企业微信 / 自定义 Webhook。
+/** 项目消息通道：把该项目的任务完成提醒推到钉钉 / 企业微信 / 自定义 Webhook。
  *
  * 交互只有两步，界面按这个顺序自上而下排：
  *   ① 在钉钉/企微群里加一个「群机器人」，把 Webhook 地址粘进来 → ② 点「发测试消息」当场确认通了。
  * **没有扫码、不需要公网地址**：提醒是本机主动出站推送，内网 / NAT 后面照样能发。
- * 个人微信没有官方开放接口，所以「微信」那张卡会如实说明「平台无法直接推送到个人微信」，
- * 只在用户自备第三方网关时提供填地址的入口，而不是假装能推。
+ * 传了 projectId 时只显示并绑定该项目的通道；应用凭证 / 公网回调是全局设置（所有项目共用）。
  */
-export default function ChannelsTab() {
+export default function ChannelsTab({ projectId }: { projectId?: string }) {
   const currentTeamId = useAuth((s) => s.currentTeamId);
   const [channels, setChannels] = useState<ChannelMeta[]>([]);
   const [links, setLinks] = useState<LinkRow[]>([]);
@@ -73,25 +73,25 @@ export default function ChannelsTab() {
   const [publicUrl, setPublicUrl] = useState("");
 
   const refresh = useCallback(() => {
-    api.channels().then((r: any) => {
+    api.channels(projectId).then((r: any) => {
       setChannels(r.channels || []);
       setLinks(r.links || []);
       setAppCfg(r.app_config || {});
       setPublicUrl(r.app_config?.public_base_url || "");
     }).catch((e: any) => setMsg(e?.message || "加载失败"));
-    api.channelMessages().then((r: any) => setMessages(r.items || [])).catch(() => {});
-  }, []);
+    api.channelMessages(30, projectId).then((r: any) => setMessages(r.items || [])).catch(() => {});
+  }, [projectId]);
 
   useEffect(refresh, [refresh]);
 
   useEffect(() => {
-    // 默认项目下拉：从通道发来的新话题落到哪个项目
+    // 默认项目下拉：从通道发来的新话题落到哪个项目（项目级配置不需要）
     const teamId = useAuth.getState().currentTeamId;
-    if (!teamId) return;
+    if (!teamId || projectId) return;
     api.projects(teamId).then((ps: any) => {
       setProjects((ps || []).map((p: any) => ({ id: p.id, name: p.name })));
     }).catch(() => {});
-  }, [currentTeamId]);
+  }, [currentTeamId, projectId]);
 
   const draftOf = (ch: string): Draft => drafts[ch] || EMPTY;
   const setDraft = (ch: string, patch: Partial<Draft>) =>
@@ -142,6 +142,7 @@ export default function ChannelsTab() {
       if (d.secret.trim()) body.webhook_secret = d.secret.trim();
       if (d.gateway.trim()) body.gateway_url = d.gateway.trim();
       if (d.ext.trim()) body.external_id = d.ext.trim();
+      if (projectId) body.project_id = projectId;
       const r: any = await api.channelBind(ch, body);
       setDraft(ch, EMPTY);
       setMsg(r?.message || "已关联");
@@ -204,36 +205,42 @@ export default function ChannelsTab() {
       </div>
       <div className="flex items-center gap-4 flex-wrap text-sm text-slate-700 mt-2">
         <label className="flex items-center gap-1">
-          <input type="checkbox" checked={link.notify_done}
+          <input autoComplete="off" type="checkbox" checked={link.notify_done}
             onChange={(e) => patch(link.id, { notify_done: e.target.checked })} />
           任务完成提醒
         </label>
         <label className="flex items-center gap-1">
-          <input type="checkbox" checked={link.notify_question}
+          <input autoComplete="off" type="checkbox" checked={link.notify_question}
             onChange={(e) => patch(link.id, { notify_question: e.target.checked })} />
           需要我回答时
         </label>
         <label className="flex items-center gap-1">
-          <input type="checkbox" checked={link.notify_failed}
+          <input autoComplete="off" type="checkbox" checked={link.notify_failed}
             onChange={(e) => patch(link.id, { notify_failed: e.target.checked })} />
           失败告警
         </label>
         {meta.can_inbound && (
           <label className="flex items-center gap-1">
-            <input type="checkbox" checked={link.inbound_enabled}
+            <input autoComplete="off" type="checkbox" checked={link.inbound_enabled}
               onChange={(e) => patch(link.id, { inbound_enabled: e.target.checked })} />
             允许在这里回复继续对话（需公网回调）
           </label>
         )}
       </div>
       <div className="flex items-center gap-2 flex-wrap mt-2">
-        <label className="text-xs text-slate-500">新话题落到的项目</label>
-        <select className="border border-slate-300 rounded px-2 py-1 text-sm"
-          value={link.default_project_id || ""}
-          onChange={(e) => patch(link.id, { default_project_id: e.target.value })}>
-          <option value="">（自动选第一个）</option>
-          {projects.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
-        </select>
+        {!projectId && (
+          <>
+            <label className="text-xs text-slate-500">新话题落到的项目</label>
+            <SearchSelect className="border border-slate-300 rounded px-2 py-1 text-sm bg-white"
+              value={link.default_project_id || ""}
+              onChange={(v) => patch(link.id, { default_project_id: v })}
+              title="新话题落到的项目" searchPlaceholder="搜索项目…" panelMinWidth={200}
+              options={[
+                { value: "", label: "（自动选第一个）" },
+                ...projects.map((p) => ({ value: p.id, label: p.name, keywords: p.name })),
+              ]} />
+          </>
+        )}
         <button className={btn2} disabled={busy === "test-" + link.id} onClick={() => testPush(link.id)}>
           发测试消息
         </button>
@@ -250,9 +257,10 @@ export default function ChannelsTab() {
       <div>
         <h3 className="font-medium text-slate-800">消息通道</h3>
         <p className="text-xs text-slate-500 mt-1">
-          任务跑完 / 需要你回答 / 失败时，把提醒推送到钉钉或企业微信群。
+          {projectId ? "这个项目" : "本团队"}的任务跑完 / 需要你回答 / 失败时，把提醒推送到钉钉或企业微信群。
           <span className="text-slate-700">纯出站推送，不需要公网地址、不需要扫码</span>——
           在群里加个机器人，把 Webhook 地址粘进来就行。
+          {projectId ? "这里配置的通道只推这个项目的事件。" : ""}
         </p>
       </div>
 
@@ -292,20 +300,20 @@ export default function ChannelsTab() {
               <div className="mt-3 grid grid-cols-2 gap-2">
                 <label className="text-xs text-slate-600 col-span-2">
                   <span>{dt ? "钉钉群机器人 Webhook" : "企微群机器人 Webhook"}</span>
-                  <input className={input + " mt-1"}
+                  <input autoComplete="off" className={input + " mt-1"}
                     placeholder={dt ? "https://oapi.dingtalk.com/robot/send?access_token=..." : "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..."}
                     value={d.webhook} onChange={(e) => setDraft(c.key, { webhook: e.target.value })} />
                 </label>
                 {dt && (
                   <label className="text-xs text-slate-600">
                     <span>加签密钥（选填）</span>
-                    <input className={input + " mt-1"} placeholder="机器人安全设置选「加签」时填 SEC 开头那串"
+                    <input autoComplete="off" className={input + " mt-1"} placeholder="机器人安全设置选「加签」时填 SEC 开头那串"
                       value={d.secret} onChange={(e) => setDraft(c.key, { secret: e.target.value })} />
                   </label>
                 )}
                 <label className={dt ? "text-xs text-slate-600" : "text-xs text-slate-600 col-span-2"}>
                   <span>{dt ? "接收人 userid（选填）" : "接收人 userid / 手机号（选填）"}</span>
-                  <input className={input + " mt-1"} placeholder="留空=只发到群里；填了就定向发给这个人"
+                  <input autoComplete="off" className={input + " mt-1"} placeholder="留空=只发到群里；填了就定向发给这个人"
                     value={d.ext} onChange={(e) => setDraft(c.key, { ext: e.target.value })} />
                 </label>
               </div>
@@ -315,7 +323,7 @@ export default function ChannelsTab() {
               <div className="mt-3">
                 <label className="text-xs text-slate-600">
                   <span>自备网关地址（选填，仅在你已有 wechaty 等网关时填）</span>
-                  <input className={input + " mt-1"} placeholder="http://127.0.0.1:8788/send"
+                  <input autoComplete="off" className={input + " mt-1"} placeholder="http://127.0.0.1:8788/send"
                     value={d.gateway} onChange={(e) => setDraft(c.key, { gateway: e.target.value })} />
                 </label>
               </div>
@@ -335,7 +343,7 @@ export default function ChannelsTab() {
             {(dt || wc) && (
               <details className="mt-3">
                 <summary className="text-xs text-slate-600 cursor-pointer">
-                  企业内部应用凭证（可选：想定向私聊推送才需要）
+                  企业内部应用凭证（可选：想定向私聊推送才需要；全局，所有项目共用）
                 </summary>
                 <div className="grid grid-cols-2 gap-2 mt-2">
                   {(dt ? [
@@ -352,7 +360,7 @@ export default function ChannelsTab() {
                         {label}
                         {ready && <span className="text-[10px] text-green-700">已配置</span>}
                       </span>
-                      <input className={input + " mt-1"} value={cfgDraft[k] ?? ""}
+                      <input autoComplete="off" className={input + " mt-1"} value={cfgDraft[k] ?? ""}
                         placeholder={ready ? "••••••（留空表示不修改）" : "未配置"}
                         onChange={(e) => setCfgDraft({ ...cfgDraft, [k]: e.target.value })} />
                     </label>
@@ -376,7 +384,7 @@ export default function ChannelsTab() {
           不要拿它填钉钉/企微的群机器人地址（格式不符会被拒），那两个请用上面的卡片。
         </p>
         <div className="flex gap-2 mt-2">
-          <input className={input} placeholder="https://example.com/hook"
+          <input autoComplete="off" className={input} placeholder="https://example.com/hook"
             value={draftOf("webhook").webhook}
             onChange={(e) => setDraft("webhook", { webhook: e.target.value })} />
           <button className={btn} disabled={busy === "bind-webhook"} onClick={() => bindChannel("webhook")}>绑定</button>
@@ -428,7 +436,7 @@ export default function ChannelsTab() {
           才需要一个通道服务器能访问到的公网地址（内网穿透 / 域名），并填好应用凭证里的 Secret 做验签。
         </p>
         <div className="flex gap-2 mt-2">
-          <input className={input} placeholder="https://your-domain.com" value={publicUrl}
+          <input autoComplete="off" className={input} placeholder="https://your-domain.com" value={publicUrl}
             onChange={(e) => setPublicUrl(e.target.value)} />
           <button className={btn} disabled={busy === "public"} onClick={savePublicUrl}>保存</button>
         </div>

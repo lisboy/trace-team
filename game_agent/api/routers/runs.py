@@ -12,10 +12,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from game_agent.api.deps import get_current_context, require
+from game_agent.api.deps import get_current_context, owns_session, require, require_chat
 from game_agent.api.state import state
 from game_agent.auth.rbac import (PERM_COMMENT, PERM_RUN_CANCEL_OTHERS, PERM_RUN_CANCEL_SELF,
                                   PERM_RUN_CREATE, PERM_VIEW)
@@ -29,6 +29,18 @@ from game_agent.logging_setup import get_logger
 log = get_logger("api.runs")
 
 router = APIRouter(prefix="/api", tags=["runs"])
+
+
+def _main_only_clause():
+    """「只算主对话」的过滤条件：agent_key 属于主对话角色（旧行是 planner/artist/voice，
+    极早期行没有 agent_key 记 NULL）。
+
+    与 sessions.py 的 MAIN_AGENT_KEYS 同一口径：子agent（agent_key='sub'）的往返
+    是 spawn_agents 派出的一次性只读调研，不计入主对话的 token/速度/上下文
+    （用户 2026-11-16 要求「子和主分开，这里只统计主的」）。
+    """
+    return or_(LlmCall.agent_key.is_(None),
+               LlmCall.agent_key.in_(("main", "planner", "artist", "voice")))
 
 
 @router.get("/runs/{run_id}")
@@ -47,7 +59,13 @@ async def run_detail(run_id: str, ctx: RequestContext = Depends(require(PERM_VIE
                    func.coalesce(func.sum(LlmCall.cached_tokens), 0),
                    func.coalesce(func.sum(LlmCall.latency_ms), 0),
                    func.coalesce(func.sum(LlmCall.cache_reported), 0))
-            .where(LlmCall.run_id == _u(run_id)))).one()
+            .where(LlmCall.run_id == _u(run_id), _main_only_clause()))).one()
+        # 子agent 那一份单列：面板头部显示「主对话 N 次调用」，
+        # 子agent 的量挂在旁边（用户 2026-11-16：子和主分开统计，子的在「子agent」标签看）
+        sub = (await s.execute(
+            select(func.count(), func.coalesce(func.sum(LlmCall.prompt_tokens), 0),
+                   func.coalesce(func.sum(LlmCall.completion_tokens), 0))
+            .where(LlmCall.run_id == _u(run_id), LlmCall.agent_key == "sub"))).one()
         prompt, completion, cached, total_ms = int(u[1]), int(u[2]), int(u[3]), int(u[4])
         reported = int(u[5])
         # 当前是否停在一个待回答的提问上（同一 run 内暂停）：让前端在刷新/重连后也能
@@ -65,6 +83,10 @@ async def run_detail(run_id: str, ctx: RequestContext = Depends(require(PERM_VIE
             "cache_hit_rate": round(cached / prompt * 100, 1)
             if (prompt > 0 and reported > 0) else None,
             "cache_reported": reported > 0,
+            # 子agent 那一份：**不含在**上面的主对话数字里，只给个数量让界面能提示
+            # 「另有 N 次子agent 调用」，明细在运行面板「子agent」标签。
+            "sub_calls": int(sub[0] or 0),
+            "sub_tokens": int(sub[1] or 0) + int(sub[2] or 0),
         }
     return {
         "id": str(run.id), "status": run.status, "run_type": run.run_type,
@@ -287,99 +309,68 @@ class SteerIn(BaseModel):
     # 运行中「改运行选项」：能力开关 / 会话权限 / 仅分析。带上即改这一轮后续的硬约束
     # （重新裁剪工具白名单、覆盖权限作用域、换系统提示里的约束块）。不传 = 本次不动。
     caps: dict | None = None            # {test,web,media}
-    permission_scope: str | None = None  # workspace | full
     analyze: bool | None = None          # 仅分析（运行中可开/可关）
 
 
 @router.post("/runs/{run_id}/steer")
 async def steer_run(run_id: str, body: SteerIn,
-                    ctx: RequestContext = Depends(require(PERM_RUN_CREATE))):
-    """插话 / 运行中切换模型：并进**正在执行**的这一轮，不取消、不重开。
+                    ctx: RequestContext = Depends(require_chat())):
+    """插话：并进**正在执行**的这一轮，不取消、不重开。
 
     与会话里正常发消息的区别：那会开一个新 run（组长从零开始，还得重新探路）；
     插话只是往当前这轮的对话里追加一条 user 消息，下一轮 LLM 调用前由 runtime 取走，
     已完成的步骤/工具结果/计划全部保留。
 
+    权限（2026-11-17，用户要求「插话、编辑插话，需求人员应该允许」）：与发消息同一道门
+    `require_chat()`，需求（viewer）也能插。但 viewer 只许插**自己会话里正在跑的只读分析**
+    ——viewer 发起的 run 一律是 analyze（sessions.py 强制），且本项目会话已按账号隔离，
+    越权拿到别人的 run_id 也插不进去；也不能借插话把 analyze 改成 modify。
+
     带图插话（2026-10-29）：图片与聊天发送共用 `_validate_images`（同样压到进上下文那一版、
     原图另存 .trace/uploads），runtime 拼成带 image parts 的 user 消息。图不走视觉回灌，
     所以不会下一轮就过期。
 
-    运行中切换模型（2026-11-01）：body 带 model_profile_key / reasoning_effort 时，除插话外
-    还要把这一轮后续的 LLM 换成新档位。实现上：校验档位 → 写回 run.options_json（这样
-    「失败后继续 / 清单未完成自动续跑」不会悄悄退回角色默认）→ 推进 steering 邮箱，
-    runtime 下一轮开头用 _load_profile 重新解析并重建 LLM。只切模型、不带文字/图的请求
-    不落聊天消息，只广播一条状态提示。
+    团队版：运行中不允许切换模型。body 里的 model_profile_key / reasoning_effort 会被
+    忽略；模型始终以项目绑定的档位为准（管理员在团队页配置）。
     """
     from game_agent.api.routers.sessions import (FileIn, _resolve_files, _validate_files,
                                                  _validate_images)
     from game_agent.orchestration import steering
 
     text = (body.content or "").strip()
-    # 只切模型的请求：没有文字/图/附件，但有模型字段（model_profile_key 可能是空串=跟随默认）
-    is_model_switch = body.model_profile_key is not None or body.reasoning_effort is not None
-    # 改运行选项的请求：能力开关 / 会话权限 / 仅分析，任一带上即算（可叠加在插话上）
-    is_settings_switch = (body.caps is not None or body.permission_scope is not None
-                          or body.analyze is not None)
-    if not text and not body.images and not body.files and not is_model_switch \
-            and not is_settings_switch:
+    # 改运行选项的请求：能力开关 / 仅分析，任一带上即算（可叠加在插话上）。
+    # 团队版没有「权限作用域」选项，旧前端传 permission_scope 一律忽略。
+    is_settings_switch = (body.caps is not None or body.analyze is not None)
+    if not text and not body.images and not body.files and not is_settings_switch:
         raise HTTPException(status_code=400, detail="插话内容为空")
-    model_switch: dict | None = None
-    if is_model_switch:
-        effort = body.reasoning_effort
-        if effort:
-            if effort not in ("none", "minimal", "low", "medium", "high"):
-                raise HTTPException(status_code=400, detail="推理等级不合法")
-        else:
-            effort = ""
-        pkey = (body.model_profile_key or "").strip()
-        # 档位是否存在在下面开事务后再校验（要用到 team_id 与 DB 会话）
-        model_switch = {"profile_key": pkey, "effort": effort}
-    # 运行选项：只归一化，不在此校验（permission_scope 走 normalize_scope 的容错默认）
     settings_switch: dict | None = None
     if is_settings_switch:
-        from game_agent.orchestration import policy as policy_mod
         from game_agent.orchestration.caps import normalize_caps
         settings_switch = {}
         if body.caps is not None:
             settings_switch["caps"] = normalize_caps(body.caps)
-        if body.permission_scope is not None:
-            settings_switch["permission_scope"] = policy_mod.normalize_scope(body.permission_scope)
         if body.analyze is not None:
             settings_switch["analyze"] = bool(body.analyze)
     client_msg_id = (body.client_msg_id or "").strip()[:64]
-    switch_label: str | None = None
     async with SessionLocal() as s:
         run, _project, workspace = await _run_workspace(s, run_id, ctx)
+        if ctx.role == "viewer":
+            # 需求只许插自己会话里正在跑的只读分析（run id 是 UUID，但不靠猜不到当权限）
+            sess = await s.get(Session, _u(run.session_id))
+            if sess is None or not owns_session(ctx, sess.created_by):
+                raise HTTPException(status_code=404, detail="run 不存在")
+            if run.run_type != "analyze":
+                raise HTTPException(status_code=403,
+                                    detail="需求角色只能在只读分析中插话")
+            if settings_switch is not None and (
+                    "caps" in settings_switch or settings_switch.get("analyze") is False):
+                raise HTTPException(status_code=403,
+                                    detail="需求角色不能调整运行选项")
         snap = {"status": run.status, "session_id": run.session_id,
                 "project_id": run.project_id}
         if snap["status"] in ("succeeded", "failed", "cancelled", "blocked", "orphaned"):
             return {"ok": False, "delivered": False,
                     "detail": f"该任务已结束（{snap['status']}），按新消息发送即可"}
-        # 切换模型：档位必须存在（本团队、kind=llm），否则报错；随后写回 options_json
-        if model_switch is not None:
-            pkey = model_switch["profile_key"]
-            if pkey:
-                from game_agent.db.models import ModelProfile
-                from sqlalchemy import select as _select
-                prof = await s.scalar(_select(ModelProfile).where(
-                    ModelProfile.team_id == _u(ctx.team_id),
-                    ModelProfile.key == pkey,
-                    ModelProfile.kind == "llm"))
-                if prof is None:
-                    raise HTTPException(status_code=400, detail="所选模型档位不存在")
-                switch_label = prof.model or prof.label or pkey
-            opts = dict(run.options_json or {})
-            if pkey:
-                opts["model_profile_key"] = pkey
-            else:
-                opts.pop("model_profile_key", None)  # 空串=回到跟随角色默认
-            if model_switch["effort"]:
-                opts["reasoning_effort"] = model_switch["effort"]
-            else:
-                opts.pop("reasoning_effort", None)
-            # 关键：续跑（continue_run）与自动续跑都从 options_json 继承模型，
-            # 不回写这里的话，切完模型再点「继续」会悄悄回到角色默认档。
-            run.options_json = opts
         # 改运行选项：写回 options_json（续跑 / 自动续跑继承新值）。用 SQLAlchemy 的
         # flag_modified 标记 JSON 列已变更——原地改 dict 有时不触发 UPDATE。
         if settings_switch is not None:
@@ -387,8 +378,6 @@ async def steer_run(run_id: str, body: SteerIn,
             opts = dict(run.options_json or {})
             if "caps" in settings_switch:
                 opts["caps"] = settings_switch["caps"]
-            if "permission_scope" in settings_switch:
-                opts["permission_scope"] = settings_switch["permission_scope"]
             if "analyze" in settings_switch:
                 # 仅分析以 run_type 落地（续跑按 run.run_type 继承）；这里同步一份到 options
                 opts["analyze"] = settings_switch["analyze"]
@@ -447,20 +436,9 @@ async def steer_run(run_id: str, body: SteerIn,
                 payload={"session_id": str(snap["session_id"]), "message_id": str(msg.id),
                          "author_type": "user", "kind": "steer"},
             ))
-        if model_switch is not None:
-            target = f"「{switch_label}」" if switch_label else "跟随角色默认"
-            if model_switch["effort"]:
-                target += f"，推理等级 {model_switch['effort']}"
-            await state.services.bus.emit(EventEnvelope(
-                team_id=str(ctx.team_id), project_id=str(snap["project_id"]),
-                run_id=str(run_id), type="status",
-                payload={"status": "running",
-                         "note": f"已收到模型切换 → {target}；当前这一轮仍用原模型跑完，"
-                                 "下一个思考轮次生效"},
-            ))
     except Exception:  # noqa: BLE001 - 广播失败不影响投递，前端仍会轮询补拉
         pass
-    steering.push(run_id, noted, images, model=model_switch)
+    steering.push(run_id, noted, images)
     if settings_switch is not None:
         steering.push_settings(run_id, settings_switch)
     # 插话分派（用户 2026-11-11 要求）：如果这一轮有正在跑的子agent，由**大模型**判断这条
@@ -483,11 +461,13 @@ async def steer_run(run_id: str, body: SteerIn,
             task_ids = [str(t.id) for t in running_subs]
 
             async def _dispatch(note_text: str, subs: list[dict], tids: list[str],
-                                team_id: str) -> None:
+                                team_id: str, project_id: str) -> None:
                 from game_agent.orchestration import interject
                 try:
-                    pkey = await state.orchestrator._agent_profile_key(team_id, "main")
-                    profile = await state.orchestrator._load_profile(team_id, pkey)
+                    pkey = await state.orchestrator._agent_profile_key(
+                        team_id, "main", project_id)
+                    profile = await state.orchestrator._load_profile(
+                        team_id, pkey, project_id=project_id)
                 except Exception:  # noqa: BLE001
                     profile = {}
                 try:
@@ -500,13 +480,46 @@ async def steer_run(run_id: str, body: SteerIn,
                         log.info("interjection dispatched to subagent %s", tids[idx][:8])
 
             import asyncio as _asyncio
-            _asyncio.create_task(_dispatch(noted, subs_info, task_ids, str(ctx.team_id)))
+            _asyncio.create_task(_dispatch(noted, subs_info, task_ids, str(ctx.team_id),
+                                           str(snap["project_id"])))
     return {"ok": True, "delivered": True, "images": len(images), "files": len(files)}
+
+
+async def _events_for_task(run_id: str, task_id: str) -> list[dict]:
+    """某个子agent 自己的事件流（运行面板「子agent」弹窗按需拉取用）。
+
+    为什么不复用 `get_events_since` 再在前端过滤：一条长 run 能有 1400+ 事件、1.5MB，
+    为了看一个子agent 的十几步就把整条流搬过来太浪费。也不能只按 Event.task_id 过滤：
+    `task_start`/`task_done` 由 orchestrator 广播，Event.task_id 是空的、真正的 task_id
+    只写在 payload 里（前端 groupRows 就是按 payload.task_id 归组的）。所以 SQL 先粗筛
+    「本 task 的事件 + 全部 task_start/task_done」，再按 payload 精确判一次。
+    """
+    want = task_id.replace("-", "").lower()
+    async with SessionLocal() as s:
+        rows = (await s.execute(
+            select(Event)
+            .where(Event.run_id == _u(run_id),
+                   or_(Event.task_id == _u(task_id),
+                       Event.type.in_(("task_start", "task_done"))))
+            .order_by(Event.seq))).scalars().all()
+    out: list[dict] = []
+    for e in rows:
+        tid = str(e.task_id or (e.payload_json or {}).get("task_id") or "")
+        if tid.replace("-", "").lower() != want:
+            continue
+        out.append({"seq": e.seq, "type": e.type, "payload": e.payload_json,
+                    "task_id": str(e.task_id) if e.task_id else None,
+                    "created_at": str(e.created_at)})
+    return out
 
 
 @router.get("/runs/{run_id}/events")
 async def run_events(run_id: str, since: int = Query(0),
+                     task_id: str | None = Query(None),
                      ctx: RequestContext = Depends(require(PERM_VIEW))):
+    """run 的事件流。task_id 非空时只回这个子agent 自己的事件（弹窗看对话详情用）。"""
+    if task_id:
+        return await _events_for_task(run_id, task_id)
     events = await state.services.repo.get_events_since(run_id, since)
     return [{"seq": e.seq, "type": e.type, "payload": e.payload_json,
              # task_id：子agent 的事件带自己的 task，前端靠它把行归进对应的子agent 分组
@@ -551,7 +564,7 @@ async def _run_workspace(s, run_id: str, ctx: RequestContext):
     if run is None or str(run.team_id) != ctx.team_id:
         raise HTTPException(status_code=404, detail="run 不存在")
     project = await s.get(Project, run.project_id)
-    if project is None:
+    if project is None or str(project.id) not in ctx.project_ids:
         raise HTTPException(status_code=404, detail="项目不存在")
     return run, project, (PROJECTS_ROOT / project.repo_path)
 
@@ -1115,12 +1128,15 @@ def _tail_head(s: str, limit: int, head: int = 80) -> str:
     """尾部优先截断：前 head 字作锚点 + 尾部主体（续跑摘要用）。
 
     模型/工具的关键结论多在尾部，旧逻辑取头会把根因/行号丢掉，续跑时二次丢失。
+    标记写明中间省略多少字：这既是给模型看的（知道中间有缺口、需要时重查），
+    也让同一套标记在 UI 上能自解释（前端把它渲染成「此处中间省略 N 字」）。
     """
     one = _one_line(s, limit * 4)
     if len(one) <= limit:
         return one
     tail = one[-(limit - head):]
-    return one[:head] + "…[中略]…" + tail
+    omitted = max(len(one) - head - len(tail), 0)
+    return one[:head] + f"…[中略 {omitted} 字]…" + tail
 
 
 async def _touched_files_brief(s, run_id) -> str:
@@ -1373,29 +1389,11 @@ async def continue_run(run_id: str, body: ContinueIn | None = None,
         cont_sess = await s.get(Session, run.session_id)
         if cont_sess is not None:
             cont_sess.last_active = datetime.now(timezone.utc)
-        # 续跑沿用上次的模型/推理等级与能力开关：否则中途点「继续」会悄悄换回角色默认模型
+        # 续跑沿用上次的模型/推理等级与能力开关：否则中途点「继续」会悄悄换回角色默认模型。
         cont_opts = {**(run.options_json or {}), **cont_meta}
-        # 前端明确带了当前选择器里的模型 → 覆盖（用户刚切过、或想换模型再续跑）
-        if body is not None and (body.model_profile_key is not None
-                                 or body.reasoning_effort is not None):
-            pkey = (body.model_profile_key or "").strip()
-            if pkey:
-                from game_agent.db.models import ModelProfile
-                prof = await s.scalar(select(ModelProfile).where(
-                    ModelProfile.team_id == _u(ctx.team_id),
-                    ModelProfile.key == pkey, ModelProfile.kind == "llm"))
-                if prof is None:
-                    raise HTTPException(status_code=400, detail="所选模型档位不存在")
-                cont_opts["model_profile_key"] = pkey
-            else:
-                cont_opts.pop("model_profile_key", None)
-            effort = (body.reasoning_effort or "").strip()
-            if effort:
-                if effort not in ("none", "minimal", "low", "medium", "high"):
-                    raise HTTPException(status_code=400, detail="推理等级不合法")
-                cont_opts["reasoning_effort"] = effort
-            else:
-                cont_opts.pop("reasoning_effort", None)
+        # 团队版：不允许在续跑时换模型。项目绑定了档位就以项目为准（管理员配置）。
+        if project is not None and project.model_profile_key:
+            cont_opts["model_profile_key"] = project.model_profile_key
         new_run = Run(team_id=run.team_id, project_id=run.project_id, session_id=run.session_id,
                       triggered_by=_u(ctx.user_id), trigger_msg_id=None,
                       run_type=run.run_type, options_json=cont_opts,

@@ -47,7 +47,11 @@ _tmp_smooth/
 /_*.png
 /_*.py
 /_*.ps1
+/_*.log
 /3000
+
+# ---- 桌宠立绘源图 / 试音草稿（运行期资产已在 desktop_pet/renderer/assets）----
+/assets/
 
 # ---- 打包产物（由 package.cmd 现场生成）----
 dist_exe/
@@ -60,3 +64,8 @@ backup_db_migration/
 # ---- 操作系统 ----
 Thumbs.db
 .DS_Store
+
+# ---- Linux 团队版打包缓存 / 舞台 ----
+packaging/linux-team/vendor/
+packaging/linux-team/stage/
+packaging/linux-team/vcs-build/

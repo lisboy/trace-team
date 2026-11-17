@@ -352,7 +352,8 @@ def test_continue_run_creates_run_with_brief_in_options_and_no_message(session_f
         monkeypatch.setattr(state_mod.state, "session_factory", session_factory)
         monkeypatch.setattr(state_mod.state, "services",
                             SimpleNamespace(queue=q))
-        ctx = RequestContext(user_id=user_id, team_id=team_id, role="owner")
+        ctx = RequestContext(user_id=user_id, team_id=team_id, role="owner",
+                             project_ids=[str(run.project_id)])
         res = await continue_run(run_id, None, ctx)
 
         async with session_factory() as s:

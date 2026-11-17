@@ -1,19 +1,27 @@
 import { create } from "zustand";
+import { clearToken, getToken, setToken } from "./api";
 import type { Team, User } from "./types";
 
 const KEY = "ga_profile";
 
 /**
- * 本机身份（没有登录）：只是「界面怎么称呼我」+ 当前工作区的缓存。
- * 没有 token / 会话 / 登出——服务就是本机这一个用户，刷新页面也不需要重新认证。
+ * 登录身份：Bearer 令牌 + 当前账号/团队。
+ * 令牌放 localStorage（ga_token），这里只是内存镜像；刷新后由 /auth/me 校验。
+ * 非管理员看不到团队页与模型配置（前端只做体验，后端才是安全闸门）。
  */
 interface AuthState {
   user: User | null;
   teams: Team[];
   currentTeamId: string | null;
+  token: string | null;
+  mustChangePassword: boolean;
+  setLogin: (r: { token: string; user: User; teams: Team[]; current_team?: string | null;
+                   must_change_password?: boolean }) => void;
   setIdentity: (user: User, teams: Team[]) => void;
   setUser: (user: User) => void;
   setTeams: (teams: Team[]) => void;
+  setMustChangePassword: (v: boolean) => void;
+  clearAuth: () => void;
 }
 
 function load(): Partial<AuthState> {
@@ -38,18 +46,42 @@ function persist(s: AuthState) {
 }
 
 const initial = load();
-// 历史数据可能存了空串，统一归为「未选择」再回退到第一个工作区
-// （个人版：一台机器一个工作区，teams 里只会有 ≥1 条；字段名沿用 team 是为了不动后端的分片 id）
 const initialTeamId = initial.currentTeamId || initial.teams?.[0]?.id || null;
+
+export function isAdminUser(u: User | null | undefined): boolean {
+  return !!u && (u.is_admin || u.role === "owner" || u.role === "admin");
+}
 
 export const useAuth = create<AuthState>((set, get) => ({
   user: initial.user ?? null,
   teams: initial.teams ?? [],
   currentTeamId: initialTeamId,
+  token: getToken(),
+  mustChangePassword: !!initial.user?.must_change_password,
 
-  setIdentity: (user, teams) => {
-    const next = { user, teams, currentTeamId: teams[0]?.id ?? null };
+  setLogin: (r) => {
+    setToken(r.token);
+    const currentTeamId = r.current_team || r.teams[0]?.id || null;
+    const next = {
+      user: r.user,
+      teams: r.teams,
+      currentTeamId,
+      token: r.token,
+      mustChangePassword: !!r.must_change_password,
+    };
     persist({ ...get(), ...next });
+    set(next);
+  },
+  setIdentity: (user, teams) => {
+    const cur = get();
+    const next = {
+      ...cur,
+      user,
+      teams,
+      currentTeamId: cur.currentTeamId || teams[0]?.id || null,
+      mustChangePassword: !!user.must_change_password,
+    };
+    persist(next);
     set(next);
   },
   setTeams: (teams) => {
@@ -64,8 +96,21 @@ export const useAuth = create<AuthState>((set, get) => ({
   },
   setUser: (user) => {
     const cur = get();
-    const next = { ...cur, user };
+    const next = { ...cur, user, mustChangePassword: !!user.must_change_password };
     persist(next);
     set(next);
+  },
+  setMustChangePassword: (v) => {
+    const cur = get();
+    set({ ...cur, mustChangePassword: v });
+  },
+  clearAuth: () => {
+    clearToken();
+    try {
+      localStorage.removeItem(KEY);
+    } catch {
+      /* ignore */
+    }
+    set({ user: null, teams: [], currentTeamId: null, token: null, mustChangePassword: false });
   },
 }));

@@ -53,14 +53,14 @@ def _fake_llm(monkeypatch):
 
 
 def _orchestrator(default_effort: str = ""):
-    async def _load_profile(team_id, key):
+    async def _load_profile(team_id, key, project_id=None):
         return {"model": "fast-model" if key == "fast" else "bound-model",
                 "base_url": "http://example.invalid", "protocol": "openai", "params": {}}
 
-    async def _agent_profile_key(team_id, role):
+    async def _agent_profile_key(team_id, role, project_id=None):
         return "bound"
 
-    async def _agent_defaults(team_id, role):
+    async def _agent_defaults(team_id, role, project_id=None):
         # 角色默认：绑定档位 + 默认推理等级（agents.params_json.reasoning_effort）
         return "bound", default_effort
 

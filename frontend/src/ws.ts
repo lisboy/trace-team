@@ -1,5 +1,4 @@
-import { api } from "./api";
-import { useAuth } from "./store";
+import { api, getToken } from "./api";
 import type { WSEvent } from "./types";
 
 /**
@@ -20,12 +19,12 @@ export class ProjectSocket {
   wantedSeq = 0;
 
   constructor(private projectId: string) {
-    const teamId = useAuth.getState().currentTeamId;
     const proto = location.protocol === "https:" ? "wss" : "ws";
-    // 没有登录：不再传 token；team_id 仅用于日志/兼容，后端以本机身份为准
+    // 浏览器 WebSocket 带不了 Authorization 头 → 令牌走查询参数，后端校验归属与分派
+    const token = getToken() || "";
     this.url =
       `${proto}://${location.host}/ws/projects/${projectId}` +
-      `?team_id=${encodeURIComponent(teamId || "")}`;
+      `?token=${encodeURIComponent(token)}`;
   }
 
   on(cb: (e: WSEvent) => void) {

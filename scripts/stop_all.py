@@ -1,18 +1,16 @@
-"""一键停止：关掉本服务（后端）+ 本地 ComfyUI（出图/出视频）+ 本地语音 IndexTTS2。
+"""一键停止：关掉本服务（后端）。
 
-给 stop.cmd 用，也可单独跑：  python scripts\\stop_all.py [--app-only] [--quiet]
+给 stop.cmd 用，也可单独跑：  python scripts\\stop_all.py [--quiet]
 
 为什么不用 taskkill 直接按名字杀：机器上可能还有别的 python / 别的会话起的进程，
 按名字杀会误伤。这里只用两条可靠线索：
   1) <DATA_DIR>/game_agent.pid —— 服务启动时自己写的 PID（main.py 的 _write_pidfile）；
-  2) 监听固定端口的进程 —— 端口来自 .env（COMFYUI_BASE_URL / TTS_BASE_URL）。
-命中进程连同其子进程一起结束；找不到就如实说「没在运行」，绝不谎报成功。
+  2) 监听 GA_PORT 的进程 —— 兜底，pidfile 丢了也能停。
+命中进程只结束它自己；找不到就如实说「没在运行」，绝不谎报成功。
 """
 from __future__ import annotations
 
 import argparse
-import asyncio
-import os
 import sys
 import time
 from pathlib import Path
@@ -21,17 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import psutil  # noqa: E402
 
-from game_agent.config import (  # noqa: E402
-    COMFYUI_BASE_URL, DATA_DIR, TTS_BASE_URL, is_sqlite,
-)
-
-
-def _port_of(url: str) -> int | None:
-    from urllib.parse import urlparse
-    u = urlparse((url or "").strip())
-    if not u.hostname or u.hostname not in ("127.0.0.1", "localhost", "::1"):
-        return None  # 远端服务不归我们管
-    return u.port
+from game_agent.config import DATA_DIR  # noqa: E402
 
 
 def _listeners_on(port: int) -> list[psutil.Process]:
@@ -46,27 +34,6 @@ def _listeners_on(port: int) -> list[psutil.Process]:
     except Exception:  # noqa: BLE001 - 某些系统 net_connections 需要权限
         pass
     return out
-
-
-def _kill_tree(proc: psutil.Process, label: str, quiet: bool) -> list[str]:
-    killed: list[str] = []
-    try:
-        targets = proc.children(recursive=True) + [proc]
-    except psutil.NoSuchProcess:
-        return killed
-    for p in targets:
-        try:
-            name = p.name()
-        except psutil.NoSuchProcess:
-            continue
-        try:
-            p.kill()
-            killed.append(f"{p.pid}({name})")
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
-    if killed and not quiet:
-        print(f"  已结束 {label}：{', '.join(killed)}")
-    return killed
 
 
 def _kill_one(proc: psutil.Process, label: str, quiet: bool) -> bool:
@@ -132,56 +99,10 @@ def stop_app(quiet: bool) -> bool:
     return stopped
 
 
-def stop_by_port(url: str, label: str, quiet: bool) -> bool:
-    port = _port_of(url)
-    if port is None:
-        return False
-    procs = _listeners_on(port)
-    if not procs:
-        return False
-    ok = False
-    for proc in procs:
-        ok = bool(_kill_tree(proc, f"{label}(:{port})", quiet)) or ok
-    return ok
-
-
-def stop_comfy_children(quiet: bool) -> bool:
-    """ComfyUI 若由本服务的常驻拉起，端口可能已随父进程退出而消失；这里再按端口兜一层。
-    配置端口被保留/占用自动改绑后走实际端口（见 assets/comfyui.py actual_base）。"""
-    try:
-        from game_agent.assets.comfyui import actual_base
-        comfy_url = actual_base()
-    except Exception:  # noqa: BLE001 - 模块可能因环境问题导入失败，退回配置值
-        comfy_url = COMFYUI_BASE_URL
-    return stop_by_port(comfy_url, "ComfyUI", quiet)
-
-
-def stop_tts(quiet: bool) -> bool:
-    """语音 IndexTTS2：把配置端口 + 自动改绑后的实际端口都停一遍（去重）。
-    只按配置端口停会漏掉「系统把端口改绑后实际起在别的端口」的实例。"""
-    urls: list[str] = []
-    for raw in (TTS_BASE_URL,):
-        b = (raw or "").strip().rstrip("/")
-        if b and b not in urls:
-            urls.append(b)
-    try:
-        from game_agent.assets.tts import actual_base, _all_bases
-        for b in _all_bases():
-            if b and b not in urls:
-                urls.append(b)
-        if actual_base() and actual_base() not in urls:
-            urls.append(actual_base())
-    except Exception:  # noqa: BLE001
-        pass
-    ok = False
-    for u in urls:
-        ok = stop_by_port(u, "语音 IndexTTS2", quiet) or ok
-    return ok
-
-
 def main() -> None:
-    ap = argparse.ArgumentParser(description="一键停止：服务 + ComfyUI + 语音")
-    ap.add_argument("--app-only", action="store_true", help="只停本服务，不动 ComfyUI/语音")
+    ap = argparse.ArgumentParser(description="一键停止：本地 Trace 服务")
+    # 保留旧参数：老 stop.cmd / 快捷方式可能还在传，传了也不报错
+    ap.add_argument("--app-only", action="store_true", help="兼容旧脚本（现在只停服务）")
     ap.add_argument("--quiet", action="store_true", help="少打印")
     args = ap.parse_args()
     quiet = args.quiet
@@ -190,18 +111,13 @@ def main() -> None:
     if not quiet:
         print("正在停止……")
 
-    results: list[tuple[str, bool]] = []
-    results.append(("服务(后端)", stop_app(quiet)))
-    if not args.app_only:
-        results.append(("ComfyUI", stop_comfy_children(quiet)))
-        results.append(("语音 IndexTTS2", stop_tts(quiet)))
+    stopped = stop_app(quiet)
 
     # 给进程一点时间真正退出（端口释放），再复查
     time.sleep(1.5)
     if not quiet:
         print()
-        for name, ok in results:
-            print(f"  {name}：{'已停止' if ok else '未在运行（或已随父进程退出）'}")
+        print(f"  服务(后端)：{'已停止' if stopped else '未在运行'}")
 
     # 复查后端端口是否真的没了
     try:

@@ -14,23 +14,23 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from game_agent.core.registry import get_agent_config
-from game_agent.agents.roles import ROLE_TOOLS
+from game_agent.agents.roles import READONLY_TOOLS, ROLE_TOOLS
 from game_agent.agents.runtime import AgentResult
 from game_agent.orchestration.intent import (IntentResult, classify_intent,
                                              hint_for as intent_hint_for)
 from game_agent.agents.tools.question import AskUserStop
-from game_agent.config import (AUTO_CONTINUE_MAX, COMFYUI_BASE_URL, LOCK_TTL_S, LOCK_WAIT_S,
+from game_agent.config import (AUTO_CONTINUE_MAX, LOCK_TTL_S, LOCK_WAIT_S,
                                LLM_MODEL, MAX_CONCURRENT_RUNS, PLATFORM,
                                PROJECTS_ROOT, ROLE_MODELS, SAME_PROJECT_PARALLEL, SHELL_NAME,
-                               default_python_bin)
+                               SUBAGENT_TIMEOUT_S, default_python_bin)
 from game_agent.core.abstractions import EventEnvelope, FencingLost
 from game_agent.core.context import RunContext
 from game_agent.core.lite.container import CoreServices
-from game_agent.db.models import (LlmProvider, Message, ModelProfile, ProjectMemory, Run,
-                                  RunQuestion, Session, User)
+from game_agent.db.models import (LlmProvider, Message, ModelProfile, Project, ProjectMemory,
+                                  Run, RunQuestion, Session, User)
 from game_agent.db.session import SessionLocal
 from game_agent.logging_setup import get_logger
-from game_agent.llm.base import Ctx, LlmAuthError
+from game_agent.llm.base import Ctx, LlmAuthError, LlmBadEndpoint
 from game_agent.llm.context_window import DEFAULT_CONTEXT_WINDOW, estimate_tokens
 from game_agent.llm.factory import build_llm
 from game_agent.orchestration import caps as caps_mod
@@ -109,15 +109,9 @@ def _run_usage_json(usage: dict | None) -> dict:
     return out
 
 
-# 写/生成类工具（用于「有没有落地」统计；不随轮次类型裁剪——工具选择交给模型）
+# 写/落地类工具（用于「有没有落地」统计；不随轮次类型裁剪——工具选择交给模型）
 WRITE_TOOLS = {
     "write_file", "edit_file", "run_command", "start_service",
-    "generate_image", "generate_audio",
-    # 旧版派发工具名（历史 run 轨迹里还会出现，统计仍需识别）
-    "dispatch_art", "dispatch_audio",
-    "edit_image", "tts",
-    "generate_sfx", "generate_music", "upsert_voice_profile",
-    "save_character_sheet", "design_voice",
 }
 
 # 项目结构扫描时忽略的噪音目录/文件
@@ -127,31 +121,13 @@ _NOISE_DIRS = {
 }
 
 # 「真的落地了」的动作（用于「只勘察不动手」守卫：读/查/看类不算落地）
-LANDING_TOOLS = WRITE_TOOLS | {
-    "delete_file", "save_character_sheet", "screenshot_page",
-}
-
-# 项目结构扫描时忽略的噪音目录/文件
-_NOISE_DIRS = {
-    ".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build",
-    ".idea", ".vscode", ".pytest_cache", "coverage", ".ga", ".trace",
-}
-
-# 「真的落地了」的动作（用于「只勘察不动手」守卫：读/查/看类不算落地）
-LANDING_TOOLS = WRITE_TOOLS | {
-    "delete_file", "save_character_sheet", "screenshot_page",
-}
+LANDING_TOOLS = WRITE_TOOLS | {"delete_file", "screenshot_page"}
 
 # ---------- 运行能力开关（前端「运行选项」）----------
 # 默认全开；关掉后既裁剪工具（硬约束），也在本轮提示里说清楚，避免模型绕路。
 CAP_TEST_TOOLS = {"start_service", "stop_service", "service_logs", "screenshot_page"}
 CAP_WEB_TOOLS = {"web_search", "web_fetch"}
-CAP_MEDIA_TOOLS = {
-    "generate_image", "edit_image", "save_character_sheet", "generate_audio",
-    "list_voice_presets", "tts", "design_voice", "generate_sfx",
-    "generate_music", "upsert_voice_profile",
-}
-CAP_DEFAULTS = {"test": True, "web": True, "media": True}
+CAP_DEFAULTS = {"test": True, "web": True}
 
 
 def normalize_caps(raw: object) -> dict[str, bool]:
@@ -170,8 +146,6 @@ def caps_tool_filter(whitelist: list[str], caps: dict[str, bool]) -> list[str]:
         drop |= CAP_TEST_TOOLS
     if not caps.get("web", True):
         drop |= CAP_WEB_TOOLS
-    if not caps.get("media", True):
-        drop |= CAP_MEDIA_TOOLS
     return [w for w in whitelist if w not in drop] if drop else whitelist
 
 
@@ -191,9 +165,6 @@ def caps_hint(caps: dict[str, bool]) -> str:
     if not caps.get("web", True):
         parts.append("【本轮关闭了联网】不要 web_search / web_fetch；缺外部资料就基于现有代码判断，"
                      "并把不确定的地方写进汇报。")
-    if not caps.get("media", True):
-        parts.append("【本轮关闭了出图与配音】不要调用 generate_image / edit_image / generate_audio / tts "
-                     "等媒体工具；任务需要素材时先说明「需要开启出图/配音」再继续。")
     return "\n".join(parts)
 
 # run_command 命中这些前缀视为「只读查看」，不算落地
@@ -253,7 +224,7 @@ class Orchestrator:
         return (not c) or any(c.startswith(p) for p in _READONLY_CMD_PREFIXES)
 
     async def _landed_actions(self, run_id: str) -> int:
-        """本轮真正落地了几次**产品改动**（改产品代码/生成素材）。
+        """本轮真正落地了几次**产品改动**（改产品代码）。
 
         ⚠️ 过程文件不算：实测 run 27a8a2bf 写了 23 个 target/_probe_*.mjs、
         跑了 90 条命令（全是 node -e 读文件 / 查数据库 / 扫目录），产品代码一行没改，
@@ -282,9 +253,6 @@ class Orchestrator:
                 rel = str(args.get("path") or "").strip()
                 if rel and not is_scratch_path(rel):
                     n += 1
-            elif tool in ("generate_image", "generate_audio",
-                          "dispatch_art", "dispatch_audio"):
-                n += 1
         return n
 
     # ---------- 顶层 run 生命周期 ----------
@@ -298,13 +266,28 @@ class Orchestrator:
             await repo.update_run(run_id, status="failed", error="项目不存在")
             return
         workspace = PROJECTS_ROOT / project.repo_path
+        # 团队版：项目绑定 Git/SVN 后，先拉最新内容到工作区，再开始排查/修改。
+        # 同步失败只作为提示带进本轮，绝不阻断对话。
+        sync_note = ""
+        try:
+            from game_agent.integrations import vcs as _vcs
+            synced = await _vcs.sync_project_workspace(project, workspace)
+            if not synced.get("ok"):
+                sync_note = (f"（仓库同步失败：{synced.get('message') or '未知原因'}；"
+                             f"本轮基于当前工作区内容继续。）")
+        except Exception:  # noqa: BLE001 - 同步异常不影响 run
+            log.exception("vcs sync failed")
         # 输入框模型选择器：本轮显式选了档位/推理等级时优先用它（覆盖角色绑定），
         # 空值仍跟随角色绑定档位——保证「不改选择器 = 行为完全不变」。
         run_opts = dict(getattr(run, "options_json", None) or {})
         # 角色默认（设置 → 智能体）：绑定档位 + 默认推理等级。一次查库拿全，别拆两次。
-        agent_key, agent_effort = await self._agent_defaults(run.team_id, "main")
+        agent_key, agent_effort = await self._agent_defaults(
+            run.team_id, "main", run.project_id)
+        # 团队版：项目绑定的档位是硬约束（管理员配置），优先于任何角色默认/历史选项
+        project_key = getattr(project, "model_profile_key", None) if project else None
         session_profile = await self._load_profile(
-            run.team_id, run_opts.get("model_profile_key") or agent_key)
+            run.team_id, project_key or run_opts.get("model_profile_key") or agent_key,
+            project_id=run.project_id)
         # 推理等级：本轮显式选择 > 角色默认（输入框切模型会写回这里）> 档位自带
         effort = _norm_effort(run_opts.get("reasoning_effort")) or agent_effort
         if effort:
@@ -313,19 +296,17 @@ class Orchestrator:
                                           "reasoning_effort": effort}}
         # 会话挂载技能（渐进式披露）：None=未指定（跟随项目默认）；名单=只注入这些
         session_skills: list[str] | None = None
-        # 会话权限作用域（workspace/full）：run 选项优先，其次会话已存值；都没有走安全默认
-        session_scope: str = ""
         try:
             async with self._sf() as s:
                 sess = await s.get(Session, _u(run.session_id)) if run.session_id else None
                 if sess is not None:
                     if sess.skills_json is not None:
                         session_skills = [str(x) for x in sess.skills_json][:12]
-                    session_scope = str(getattr(sess, "permission_scope", "") or "")
         except Exception:  # noqa: BLE001 - 技能挂载读取失败不影响 run
             log.exception("read session skills failed")
-        perm_scope = policy_mod.normalize_scope(
-            run_opts.get("permission_scope") or session_scope or policy_mod.DEFAULT_SCOPE)
+        # 团队版：助手行为固定「仅工作区」，界面不再提供选项。历史会话/run 里存过
+        # full 也一律归位，否则升级后旧会话仍能读写工作区外的路径。
+        perm_scope = policy_mod.DEFAULT_SCOPE
         # 「继续」续跑：不写任何消息，续跑说明/图片/附件随新 run 的 options 带进来。
         # 有新触发消息时走原来的消息路径；没有就把 options 里的续跑上下文当本轮需求。
         continue_brief = ""
@@ -347,6 +328,8 @@ class Orchestrator:
                                                            project_id=run.project_id,
                                                            workspace=workspace,
                                                            session_skills=session_skills)
+        if sync_note:
+            requirement = f"{sync_note}\n\n{requirement}"
         # 连续对话：注入同会话历史消息（排除当前触发消息），让模型带着上下文理解本轮诉求
         history = await self._history_block(run.session_id, run.trigger_msg_id)
         # 续跑前沿：上一轮停在哪、清单剩什么、已经产出哪些文件。会话历史里只有聊天正文
@@ -356,18 +339,18 @@ class Orchestrator:
         if context_block:
             requirement = (f"{context_block}\n\n---\n"
                            f"以下是用户的最新要求：\n{requirement}")
-        # 意图预判（硬提示）：把「要图/要音频」这类素材需求前置成结构化指令，
+        # 意图预判（硬提示）：把「先查清楚」还是「直接改好」前置成结构化指令，
         # 避免模型绕道 grep/glob 翻脚本、最后什么也没生成（实测会耗光轮次）
         latest = ""
         if run.trigger_msg_id:
             async with self._sf() as s:
                 _m = await s.get(Message, run.trigger_msg_id)
                 # 续跑消息（手动「继续」或系统自动续跑）的正文只是一句「继续完成任务目标」，
-                # 不能拿它当「用户原话」来判定素材路由/多步计划——顺着续跑链回溯到最初那条
+                # 不能拿它当「用户原话」来判定意图/多步计划——顺着续跑链回溯到最初那条
                 # 真实需求的原话。手动继续的标记是 continue_from，自动续跑是 auto_continue_from。
                 latest = await self._resolve_user_request(s, _m)
         elif continue_brief:
-            # 无触发消息的续跑：从续跑说明里取回「上次请求原文」，用于素材意图/计划提示
+            # 无触发消息的续跑：从续跑说明里取回「上次请求原文」，用于意图/计划提示
             latest = self._brief_original_request(continue_brief)
         # 意图盘查（2026-11-14 用户拍板「保留判别、但不当闸门」）：
         # 结论**只用于两件事**——(1) 给模型一句软提示；(2) 决定「只勘察不动手」刹车开不开。
@@ -383,8 +366,10 @@ class Orchestrator:
         else:
             try:
                 profile = await self._load_profile(
-                    run.team_id, run_opts.get("model_profile_key")
-                    or (await self._agent_profile_key(run.team_id, "main")))
+                    run.team_id, getattr(project, "model_profile_key", None)
+                    or run_opts.get("model_profile_key")
+                    or (await self._agent_profile_key(run.team_id, "main", run.project_id)),
+                    project_id=run.project_id)
             except Exception:  # noqa: BLE001 - 取档位失败就交给 factory 兜底
                 profile = {}
             intent = await classify_intent(latest, profile=profile)
@@ -394,13 +379,12 @@ class Orchestrator:
                 requirement = f"{soft}\n\n---\n{requirement}"
         if inspect_only:
             # 用户亲手点了「仅分析」：那是显式指令，照办——只给结论，不动产品文件。
-            requirement = f"{self._inspect_hint()}\n\n---\n{requirement}"
+            # 「需求」角色连执行命令的权限都没有，提示里不能再叫它「照常执行验证」。
+            _readonly = bool(run_opts.get("readonly"))
+            requirement = f"{self._readonly_hint() if _readonly else self._inspect_hint()}\n\n---\n{requirement}"
         else:
-            hint = self._intent_hint(latest)
             ask_hint = self._ask_hint(requirement_text=latest, full=requirement)
-            if hint:
-                requirement = f"{hint}\n\n---\n{requirement}"
-            elif ask_hint:
+            if ask_hint:
                 requirement = f"{ask_hint}\n\n---\n{requirement}"
             else:
                 plan_hint = self._plan_hint(latest)
@@ -417,6 +401,8 @@ class Orchestrator:
                   "model_profile_key": run_opts.get("model_profile_key"),
                   "reasoning_effort": run_opts.get("reasoning_effort"),
                   "permission_scope": perm_scope,
+                  # 需求角色硬只读：run_agent 据此裁工具表（见 execute_run 里的 viewer 分支）。
+                  "readonly": bool(run_opts.get("readonly")),
                   # 意图盘查结论（2026-11-14）：只用于提示措辞与刹车开关，不封锁任何动作。
                   # engage=False（盘查判纯勘察）时 runtime 不装「只勘察不动手」刹车——
                   # 用户只要一个结论时不该被催着改文件；engage=True 才催落地。
@@ -495,21 +481,23 @@ class Orchestrator:
             # 模型该自己判断的（用户问「这个项目是干嘛的」也会被当成要动手，白重跑两轮）。
             # 现在只纠正一种**自相矛盾**的情况：模型自己说要改（立了清单/说改完），却一个产品
             # 改动都没落。纯问答/只给方案不在此列——那是模型对需求的正常判断，不该被推翻。
+            # 另外，用户这一轮的意图盘查是 survey（只要结论/只读诊断）时，零落地本来就是
+            # 正常交付（2026-11-17 用户：「不一定要落地修改，根据用户需求来」）：不催、不续跑。
+            engage = bool(run_ctx.meta.get("engage"))
             plan_items_now = await self._plan_items(run_id)
             open_items_now = [i for i in plan_items_now if str(i.get("status")) != "completed"]
             claimed_action = self._claims_action(main_res, self._summaries.get(run_id) or "")
             landed = await self._landed_actions(run_id)
-            will_correct = bool(open_items_now) or (claimed_action and landed == 0)
+            will_correct = engage and (bool(open_items_now) or (claimed_action and landed == 0))
             if will_correct and self._summaries.get(run_id):
                 await self._post_reply(run_ctx, run, self._summaries[run_id])
             # 「只勘察、不动手」守卫（用户最常抱怨的失职）：
             # 但触发条件改成模型自己的承诺：清单里还有未完成项，或汇报里明确说了「已改/已生成」。
             nudge = (
                 "【系统纠正】你刚才只做了定位/勘察，没有任何落地动作"
-                "（没写文件、没生成素材、没起服务），"
+                "（没写文件、没起服务），"
                 "但你的待办清单/汇报里还留着要做的事。用户要的是「改完能用」，不是勘察报告。现在立刻执行：\n"
                 "· 要改代码：自己用 write_file / edit_file 直接改（路径/行号你已经查到了）；\n"
-                "· 要素材：generate_image / generate_audio 直接生成；\n"
                 "· 改完自己验证：run_command 跑测试/编译就够（起服务 + 截图是重手段，"
                 "用户明确要看效果或同一问题多轮没改好时才用），发现问题接着改；"
                 "最后 report_to_user 汇报改了什么、产物路径、验证结果。\n"
@@ -521,9 +509,9 @@ class Orchestrator:
             for attempt in range(1, 3):
                 open_items_now = [i for i in await self._plan_items(run_id)
                                   if str(i.get("status")) != "completed"]
-                if not (open_items_now or (
+                if not (engage and (open_items_now or (
                         self._claims_action(main_res, self._summaries.get(run_id) or "")
-                        and await self._landed_actions(run_id) == 0)):
+                        and await self._landed_actions(run_id) == 0))):
                     break
                 await self._emit(run_ctx, "status",
                                  {"status": "running", "note": f"补齐落地动作（第 {attempt} 次纠正）"})
@@ -568,15 +556,43 @@ class Orchestrator:
                 except Exception:  # noqa: BLE001
                     pass
             # 清单没做完 = 活儿没做完：直接排队续跑一轮，而不是等用户自己发现再点「继续」。
-            # survey-only（只勘察没落地）也一样要续：哪怕它根本没立清单，也造一条「把活做完」
-            # 的待办塞进续跑，确保这次「不判 failed」不会被理解成「这次就到此为止了」。
+            # 前提是用户这一轮确实要动手（engage=intent 是 modify）。survey 轮次（问结论、
+            # 只读诊断、调研）交付的就是回答本身，零落地是正常结果，不该续跑。
             # 续跑只是入队（毫秒级），留在 run_done 之前，保证「排队续跑」的提示先到、终态后到。
-            ac_open = open_items
-            if landed_zero and not ac_open:
+            ac_open = open_items if engage else []
+            ac_survey_only = False
+            # 零落地也不能一概续跑：纯问答/纯调研（没立清单、也没说过「已改/已生成」）
+            # 本来就不该有落地动作，续跑只会把同一个问题再答一遍。实测 2026-11-17：
+            # 一轮完整的代码地图调研汇报结束后仍连刷两条「系统自动续跑」。
+            # 只有模型自己声称改过却零落地（自相矛盾）时，才值得临时驱动一轮把活做完。
+            claimed_final = self._claims_action(main_res,
+                                                self._summaries.get(run_id) or "")
+            if engage and landed_zero and not ac_open and claimed_final:
+                # 这一条**不在 plan_json 里**，模型永远打不上勾，所以续跑说明不能把它
+                # 说成「清单还有 1 项没打勾」——那样下一轮开头就得先找这份不存在的清单
+                # （实测 2026-11-13：续跑那轮整轮都在找「磁盘上没有痕迹的那 1 项」，白跑）。
+                # 传 survey_only 让措辞说实话：上一轮只勘察没落地。
+                ac_survey_only = True
                 ac_open = [{"content": "把上一轮只做了勘察/定位、还没落地的活做完",
                             "status": "pending", "note": "上一轮未落地"}]
-            await self._auto_continue(run_ctx, run, plan_items, ac_open,
-                                      final_summary, workspace)
+            # 模型一个字都没吐、也没 report_to_user、更没落地：这不是「只勘察没落地」，
+            # 是这一轮压根没跑起来（端点 302/断网/档位失效）。旧逻辑照样排一条
+            # 「接着做」，连接一坏就一轮接一轮地续跑，聊天流里刷满「系统自动续跑」，
+            # 用户以为系统在无限重试（实测 2026-11-17 截图）。这种情况停下来、只留一句
+            # 可操作的说明，比排队重试有用。
+            model_silent = (bool(getattr(main_res, "fallback", False))
+                            and not str(self._summaries.get(run_id) or "").strip())
+            if model_silent and landed_zero:
+                log.warning("model produced nothing and nothing landed; skip auto-continue",
+                            extra={"run_id": run_id})
+                await self._post_system_note(
+                    run_ctx, run,
+                    "这一轮模型没有返回任何内容，已停止自动续跑（避免连接/模型异常时反复排队）。"
+                    "请先到「设置 → 模型配置」确认档位与网络可用，再点「继续」接续这条任务。")
+            else:
+                await self._auto_continue(run_ctx, run, plan_items, ac_open,
+                                          final_summary, workspace,
+                                          survey_only=ac_survey_only)
             # run_done 必须紧贴「回复已落地 + 续跑已入队」发出：前端的完成提醒
             # （提示音 + 桌面通知）就是靠它触发的。以前它排在 AI 记忆合并（最长 90s）
             # 和经验沉淀（最长 60s）之后，用户看着回复早出来了、提醒却要等一两分钟——
@@ -667,27 +683,6 @@ class Orchestrator:
                                 Run.project_id == project.id,
                                 Run.status.in_(("running", "claimed")),
                                 Run.id != _u(run_id)))).all()
-                        # 关服务看的是「整机还有没有别人在用显卡」，跨项目也算
-                        others_active = (await s.execute(
-                            select(Run.id).where(
-                                Run.status.in_(("running", "claimed")),
-                                Run.id != _u(run_id)))).all()
-                    # 会话结束：只关这个会话自己起过的本地媒体服务
-                    # （ComfyUI 生图 / IndexTTS2 配音），没起过的不碰——工作台、别的会话
-                    # 起的服务不替它收摊（2026-10-30 用户要求）。
-                    # 还有别的 run 在跑时不能关：GPU 服务是整机共用的，以前这里一关就把
-                    # 别的会话正在出的图/正在配的音掐掉，下一张图还得再花 15s 重新拉服务
-                    # （2026-10-30 凌晨：三个会话并行，收尾反复关 ComfyUI，配合 300s 超时
-                    # 把一批图拖成「控制台一直刷进度条、素材条不涨」）。
-                    from game_agent.assets import gpu_arbiter as _gpu
-                    used_kinds = _gpu.take_used(run.session_id)
-                    if not others_active:
-                        used_kinds |= _gpu.take_pending()
-                        await self._shutdown_media_services(run_ctx, run, used_kinds)
-                    else:
-                        _gpu.defer_stop(used_kinds)
-                        log.info("其他 run 仍在运行（%d 条），跳过关闭本地媒体服务",
-                                 len(others_active))
                     sweep_run(run_id, workspace, full=not siblings)
                 except Exception:  # noqa: BLE001
                     log.warning("收尾清理过程临时文件失败", exc_info=True)
@@ -695,35 +690,6 @@ class Orchestrator:
             # 也要补记项目记忆，否则「记忆永远停在上一轮」，用户会觉得记忆从不自动更新
             if not remembered and run.run_type == "modify":
                 await self._remember_if_dirty(run, run_id)
-
-    async def _shutdown_media_services(self, run_ctx: RunContext, run,
-                                       kinds: set[str] | None = None) -> None:
-        """run 收尾：关闭本地美术（ComfyUI）/配音（IndexTTS2）服务，释放显存。
-
-        GPU 互斥只保证「同一时刻只有一个媒体服务占着 GPU」；本次会话结束后两边都该退场，
-        不留后台进程吃显存。用户在配置里绑的是远程档位时，本地 stop 只是查不到端口、
-        自然跳过，无害。只有真停掉了进程才发系统提示，避免每轮 run 都刷一句废话。
-        kinds 为空集时说明这个 run 根本没起过生图/配音（纯文本任务），直接跳过，
-        不要顺手把工作台或别的会话正在用的服务关掉。
-        """
-        if kinds is not None and not kinds:
-            log.info("本次 run 未使用本地生图/配音服务，跳过收尾关闭")
-            return
-        try:
-            img_base = aud_base = ""
-            try:
-                img_prof = await self.resolve_media_profile(str(run.team_id), "image")
-                img_base = (img_prof or {}).get("base_url") or ""
-                aud_prof = await self.resolve_media_profile(str(run.team_id), "audio")
-                aud_base = (aud_prof or {}).get("base_url") or ""
-            except Exception:  # noqa: BLE001 - 档位解析失败不影响关服务（走全局配置兜底）
-                log.debug("收尾解析媒体档位失败，用全局配置关闭", exc_info=True)
-            from game_agent.assets.gpu_arbiter import shutdown_media_services
-            note = await shutdown_media_services(img_base, aud_base, kinds=kinds)
-            if note:
-                await self._post_system_note(run_ctx, run, note)
-        except Exception:  # noqa: BLE001 - 收尾关服务失败不影响 run 状态
-            log.warning("run 收尾关闭媒体服务失败", exc_info=True)
 
     async def _remember_if_dirty(self, run, run_id: str) -> None:
         """非成功终态但已落地改动时，补记一条项目记忆（带「未正常收尾」标记）。"""
@@ -808,17 +774,26 @@ class Orchestrator:
         # 角色全量白名单（不做任何裁剪）：运行中改「仅分析 / 能力开关」时，runtime 要在这份
         # 全量基础上重算生效白名单，而不是在已裁剪的集合上再裁（否则关掉再打开也回不来）。
         role_whitelist = list(ROLE_TOOLS.get(role, []))
+        # 「需求」角色（后端强制 analyze，options 里 readonly=true）是**硬只读**：
+        # 只留读代码/检索/汇报的工具，写文件、跑命令、起服务、派发一律不出现在工具表里——
+        # 不能只靠系统提示约束模型自觉。
+        readonly = bool((run_ctx.meta or {}).get("readonly"))
+        if readonly:
+            role_whitelist = [t for t in role_whitelist if t in READONLY_TOOLS]
         # 本轮生效白名单：只按用户手动的能力开关裁剪，轮次类型不裁
         whitelist = caps_mod.effective_whitelist(
             role_whitelist, run_ctx.run_type, (run_ctx.meta or {}).get("caps"))
 
         async with self._sf() as s:
-            cfg = await get_agent_config(s, run_ctx.team_id, role)
+            cfg = await get_agent_config(s, run_ctx.team_id, role,
+                                         project_id=run_ctx.project_id)
         # 本轮选项（输入框模型选择器）覆盖角色绑定档位：只在用户显式选择时生效
         opts = run_ctx.meta or {}
         profile_key = await self._resolve_profile_key(
-            run_ctx.team_id, role, opts, own_key=cfg.model_profile_key)
-        profile = await self._load_profile(run_ctx.team_id, profile_key)
+            run_ctx.team_id, role, opts, own_key=cfg.model_profile_key,
+            project_id=run_ctx.project_id)
+        profile = await self._load_profile(run_ctx.team_id, profile_key,
+                                           project_id=run_ctx.project_id)
         # 推理强度：本轮显式选择 > 本角色默认（agents.params_json，见 _agent_defaults）。
         # 按「本角色」而不是主agent 取：子agent 的默认仍是 factory 里的
         # GA_SUB_REASONING_EFFORT（默认 none，省 token），不会被主agent 的默认带跑。
@@ -833,25 +808,26 @@ class Orchestrator:
         workspace = PROJECTS_ROOT / project.repo_path
         python_bin = project.python_bin or default_python_bin() or None
 
-        # MCP 动态工具：项目 MCP 配置（界面 CRUD / .trace/mcp.json 兜底）声明即注册
+        # MCP 动态工具：项目 MCP 配置（界面 CRUD / .trace/mcp.json 兜底）声明即注册。
+        # 只读运行不挂：MCP 工具能力由外部服务器决定，无法保证不写，干脆不暴露。
         extra_specs: dict[str, dict] = {}
-        try:
-            from game_agent.agents.tools.mcp_client import get_mcp_manager
-            mgr = await get_mcp_manager(run_ctx.project_id, workspace)
-            if mgr is not None:
-                for mt in await mgr.list_tools():
-                    extra_specs[mt["name"]] = {"description": mt["description"],
-                                               "parameters": mt["schema"]}
-                if extra_specs:
-                    log.info("mcp tools attached: %s", ", ".join(extra_specs),
-                             extra={"run_id": run_ctx.run_id})
-        except Exception:  # noqa: BLE001 - MCP 不可用不影响主流程
-            log.exception("load mcp tools failed")
+        if not readonly:
+            try:
+                from game_agent.agents.tools.mcp_client import get_mcp_manager
+                mgr = await get_mcp_manager(run_ctx.project_id, workspace)
+                if mgr is not None:
+                    for mt in await mgr.list_tools():
+                        extra_specs[mt["name"]] = {"description": mt["description"],
+                                                   "parameters": mt["schema"]}
+                    if extra_specs:
+                        log.info("mcp tools attached: %s", ", ".join(extra_specs),
+                                 extra={"run_id": run_ctx.run_id})
+            except Exception:  # noqa: BLE001 - MCP 不可用不影响主流程
+                log.exception("load mcp tools failed")
         whitelist = whitelist + list(extra_specs)
 
         python_bin = python_bin  # noqa: F841 - 保持下方 manifest 引用顺序清晰
-        audio_line = await self._audio_capability_line(str(run_ctx.team_id))
-        manifest = self._build_manifest(project, run_ctx, python_bin, audio_line)
+        manifest = self._build_manifest(project, run_ctx, python_bin)
         # 每轮的硬约束块（指导项 + 权限作用域）必须放在系统提示**最前面**：
         # 实测（2026-11-02）挂在末尾时，前面 6k 字角色提示 + 运行环境把它的存在感压没了，
         # 模型仍然按旧习惯直接去读工作区外路径。位置在 prompt 头部才会被当成硬规则。
@@ -905,6 +881,10 @@ class Orchestrator:
         # 一段说明（让主agent 继续）」。为什么不区分就必出错：子agent 被单独点掉时若直接
         # raise，CancelledError 会穿过 spawn_agents 的 asyncio.gather，把主agent 一起打断。
         cancel_scope: dict[str, str | None] = {"scope": None}
+        # 子agent 的挂钟死线：卡在一次长工具调用/长思考里时不能无限等——到点由看门狗掐掉。
+        # 只影响这一条子任务（和用户单独点停走同一条路），不连带整轮，状态记 failed/超时。
+        sub_deadline = (time.monotonic() + SUBAGENT_TIMEOUT_S
+                        if role == "sub" and SUBAGENT_TIMEOUT_S > 0 else None)
 
         async def _watch_cancel(rt_task: "asyncio.Task") -> None:
             """取消看门狗：用户点「取消」后立即把 agent 任务掐掉。
@@ -943,6 +923,16 @@ class Orchestrator:
                                             "role": role, "task_id": str(task.id)})
                             rt_task.cancel()
                             return
+                        # 挂钟超时：一条子agent 卡住不能让整批永远收不回来
+                        # （界面上就是「还有 N 个子agent 在后台跑」一直转）。
+                        if sub_deadline is not None and time.monotonic() > sub_deadline:
+                            cancel_scope["scope"] = "timeout"
+                            log.warning("subagent exceeded %ss, cancelling it",
+                                        SUBAGENT_TIMEOUT_S,
+                                        extra={"run_id": run_ctx.run_id, "role": role,
+                                               "task_id": str(task.id)})
+                            rt_task.cancel()
+                            return
                 except asyncio.CancelledError:
                     if rt_task.done():
                         return
@@ -955,12 +945,24 @@ class Orchestrator:
         try:
             result = await agent_task
         except asyncio.CancelledError:
+            _scope = cancel_scope["scope"]
+            if role == "sub" and _scope == "timeout":
+                # 子agent 超时：落成 failed（前端能看到「超时」而不是一直 running），
+                # 并把「没跑完」如实回给主agent——它可以自己接手，或把任务拆小再派。
+                await repo.update_task(str(task.id), status="failed", finished_at=_now(),
+                                      result_json={"error": f"子agent 超时（>{SUBAGENT_TIMEOUT_S}s）"})
+                await self._emit(run_ctx, "task_done",
+                                 {"task_id": str(task.id), "role": role,
+                                  "status": "failed", "error": "超时未完成"})
+                return AgentResult(text=(
+                    f"[sub] 超过 {SUBAGENT_TIMEOUT_S}s 没跑完，已超时停止（本次核对未完成）。"
+                    "别等它了：要么自己接手查这部分，要么把问题拆小、收窄范围后重新派。"))
             await repo.update_task(str(task.id), status="cancelled", finished_at=_now())
             await self._emit(run_ctx, "task_done",
                              {"task_id": str(task.id), "role": role, "status": "cancelled"})
             # 单个子agent 被用户单独点掉：不向上抛（否则会连带打断主agent），
             # 回一段「已停止」的说明给主agent，让它知道这条线索没跑完、可以自己接手或再派。
-            if role == "sub" and cancel_scope["scope"] == "task":
+            if role == "sub" and _scope == "task":
                 return AgentResult(text="[sub] 已按用户要求停止这个子agent（本次核对未完成）。")
             raise
         except FencingLost:
@@ -987,6 +989,17 @@ class Orchestrator:
             # 或自己接手），而不是让 run 直接 failed。主agent 仍按原逻辑抛出让 run 落 failed。
             if role == "sub":
                 return AgentResult(text=f"[sub] 执行出错：LLM 端点认证/额度错误（{e}）")
+            raise
+        except LlmBadEndpoint as e:
+            # 端点地址/模型名不对（302 跳转、404/405）：重试同一个地址永远不会好，
+            # 直接把可操作的原因报出来（改 Base URL / 模型名），不再当普通失败重排。
+            await repo.update_task(str(task.id), status="failed", finished_at=_now(),
+                                  result_json={"error": "LLM 端点地址/模型配置错误"})
+            await self._emit(run_ctx, "task_done",
+                             {"task_id": str(task.id), "role": role, "status": "failed",
+                              "error": "LLM 端点地址/模型配置错误"})
+            if role == "sub":
+                return AgentResult(text=f"[sub] 执行出错：{e}")
             raise
         except asyncio.TimeoutError:
             # 单次 LLM/工具调用的超时在各自适配层内部已吞掉重试，能冒到这里说明
@@ -1228,20 +1241,46 @@ class Orchestrator:
         模型交回「128 条只写了 32 条、其余见下一步」的半成品汇报，界面却显示
         「待办清单 7/7 已完成 + 执行完毕」——用户看到的那句「做完了」是系统编的。
         现在只补一句诚实的 note，勾留给模型自己打（runtime 会打回要求它继续做）。
+
+        **例外：纯汇报项直接收口。**「向用户汇报结论」这类项没有任何可执行的工作，
+        而且模型根本打不上勾——它做完前面的活就直接 report_to_user 收尾，不会再回来
+        调一次 update_plan。实测 307 份清单里 97 份列了汇报项，其中 34 个 run 就卡在
+        这一项上被判「还没做完」，凭空多催一轮自动续跑（续跑要求它做的正是「把这次
+        汇报做完」，于是下一轮同样卡住）。这类项收尾时视为已完成并写明原因。
         """
         try:
+            from game_agent.agents.tools.plan import is_report_only_item
             run = await self.svcs.repo.get_run(run_ctx.run_id)
             items = [dict(i or {}) for i in (getattr(run, "plan_json", None) or [])]
             open_items = [i for i in items if str(i.get("status")) != "completed"]
             if not open_items:
                 return items, []
+            closed_report: list[dict] = []
+            still_open: list[dict] = []
             for it in open_items:
-                base = (it.get("note") or "").strip()
-                tail = "这次执行结束时仍未完成"
-                it["note"] = f"{base}；{tail}" if base and tail not in base else (base or tail)
-            await self.update_plan(run_ctx, items,
-                                   summary=f"这次执行结束：{len(open_items)} 项未完成")
-            return items, open_items
+                if is_report_only_item(it):
+                    # 收尾动作已由 report_to_user 完成（final_summary 就是那份汇报），
+                    # 不再挂着「未完成」去催下一轮。
+                    it["status"] = "completed"
+                    base = (it.get("note") or "").strip()
+                    tail = "本次收尾汇报已完成"
+                    it["note"] = f"{base}；{tail}" if base and tail not in base else (base or tail)
+                    closed_report.append(it)
+                else:
+                    base = (it.get("note") or "").strip()
+                    tail = "这次执行结束时仍未完成"
+                    it["note"] = f"{base}；{tail}" if base and tail not in base else (base or tail)
+                    still_open.append(it)
+            if closed_report:
+                log.info("close out plan: %s 个纯汇报项按已完成收口，剩余未完成 %s 项",
+                         len(closed_report), len(still_open),
+                         extra={"run_id": run_ctx.run_id})
+            if still_open:
+                await self.update_plan(run_ctx, items,
+                                       summary=f"这次执行结束：{len(still_open)} 项未完成")
+            elif closed_report:
+                await self.update_plan(run_ctx, items, summary="这次执行结束：清单已全部完成")
+            return items, still_open
         except Exception:  # noqa: BLE001 - 收尾失败不影响主流程
             log.exception("close out plan failed", extra={"run_id": run_ctx.run_id})
             return [], []
@@ -1272,13 +1311,17 @@ class Orchestrator:
 
     async def _auto_continue(self, run_ctx: RunContext, run, plan_items: list[dict],
                              open_items: list[dict], final_summary: str,
-                             workspace: str) -> Optional[str]:
+                             workspace: str, *, survey_only: bool = False) -> Optional[str]:
         """成功收尾但清单还有未完成项 → 自动排队一条「接着做」的新 run。
 
         为什么系统代劳：上一轮 128 条只写了 32 条，模型把剩下的写成「四、下一步
         （按这个顺序直接续）」交回来，run 却是 succeeded——用户不自己发现并点「继续」，
         活儿就永远停在那儿。这正是要消灭的「只做到一半」，所以由收尾流程直接续跑，
         而不是等人来催。未完成项、上次汇报的「下一步」原文都会塞进续跑说明。
+
+        ``survey_only``：上一轮只勘察/定位、零落地，且模型根本没立清单。此时
+        ``open_items`` 是临时造的、不在 plan_json 里，续跑说明必须按「上一轮没落地」
+        说实话，不能宣称「清单还有 N 项没打勾」——模型会去找那份不存在的清单。
         """
         if not open_items or getattr(run, "run_type", "") != "modify":
             return None
@@ -1314,9 +1357,12 @@ class Orchestrator:
                     return None  # 它在等用户拍板，不是等自己续跑
                 parts = [
                     self._AUTO_BRIEF_PREFIX,
-                    f"上一次执行结束时待办清单还有 {len(open_items)} 项没打勾，"
-                    "系统已自动接着往下做。这次的目标就是把这些做完——全部 completed 才算交付。",
-                    "上次计划进度：\n" + plan_lines,
+                    ("上一次执行只做了勘察/定位，没有任何落地（没写文件、没出产物），"
+                     "而且没有留下待办清单。这次的目标是把活真正做出来——落地了才算交付。"
+                     if survey_only else
+                     f"上一次执行结束时待办清单还有 {len(open_items)} 项没打勾，"
+                     "系统已自动接着往下做。这次的目标就是把这些做完——全部 completed 才算交付。"),
+                    "上次计划进度：\n" + (plan_lines or "（上一轮没有立清单）"),
                 ]
                 if (final_summary or "").strip():
                     parts.append("上一次执行的汇报（结尾若写「下一步」，那是派给你做的，"
@@ -1324,31 +1370,23 @@ class Orchestrator:
                 if changed:
                     parts.append("上一次执行已改动的文件（先读一遍确认现状，不要重写）：\n"
                                  + "\n".join(f"- {p}" for p in changed[:20]))
-                made: list[str] = []
-                try:
-                    for a in await self.svcs.repo.list_artifacts(str(run.id)):
-                        made.append(f"- {a.asset_kind}/{a.slug}: {a.rel_path}"
-                                    + ("（占位）" if a.is_placeholder else ""))
-                except Exception:  # noqa: BLE001 - 查不到素材不影响续跑
-                    made = []
-                if made:
-                    parts.append(f"上一次执行已产出的素材（共 {len(made)} 个，文件已在工作区，"
-                                 "**不要重画**，缺哪张补哪张）：\n" + "\n".join(made[:40]))
                 parts.append(
-                    "要求：**从中断处接着做**，已完成的不重做、已产出的素材不重画；"
+                    "要求：**从中断处接着做**，已完成的不重做；"
                     "量大的一批写成参数化、可断点续跑的脚本，用 start_service 后台跑 + "
                     "service_logs 轮询到结束，不要靠一条条工具调用数着做"
-                    "（**配音/出图例外**：素材类批量一律 generate_audio / generate_image 的 items 一次生成，"
-                    "不许写脚本或自己起语音/生图服务）；"
                     "每做完一项立刻 update_plan 把该项置 completed；"
                     "确实做不了的保持未完成并在 note 写清卡点。"
                     "不要重新提问、不要重新勘察全局、不要交「下一步怎么做」的报告。")
                 brief = "\n\n".join(parts)
+                # survey_only 时 open_items 是临时造的、不在 plan_json 里，界面若说
+                # 「清单还有 1 项没做完」就是编的（实测用户会被这句话误导去翻清单，
+                # 而清单根本不存在）。用 survey_only 标记让前端说实话。
                 msg = Message(session_id=_u(run.session_id), run_id=None, author_type="user",
                               author_id=_u(run.triggered_by), content="继续完成任务目标",
                               meta_json={"auto_continue_from": str(run.id),
                                          "auto_continue_depth": depth + 1,
-                                         "open_count": len(open_items),
+                                         "open_count": 0 if survey_only else len(open_items),
+                                         "survey_only": survey_only,
                                          "brief": brief})
                 s.add(msg)
                 await s.flush()
@@ -1373,9 +1411,13 @@ class Orchestrator:
             await self._emit(run_ctx, "message_new", {
                 "session_id": str(run_ctx.session_id), "message_id": str(msg.id)})
             await self._emit(run_ctx, "status", {"status": "running",
-                                                "note": (f"清单还有 {len(open_items)} 项未完成，"
-                                                         f"已自动排队续跑（第 {depth + 1}/"
-                                                         f"{AUTO_CONTINUE_MAX} 次）")})
+                                                "note": (("上一轮只勘察没落地，"
+                                                          f"已自动排队续跑（第 {depth + 1}/"
+                                                          f"{AUTO_CONTINUE_MAX} 次）")
+                                                         if survey_only else
+                                                         (f"清单还有 {len(open_items)} 项未完成，"
+                                                          f"已自动排队续跑（第 {depth + 1}/"
+                                                          f"{AUTO_CONTINUE_MAX} 次）"))})
             log.info("auto-continue enqueued", extra={"run_id": str(run.id),
                                                       "next_run": new_id, "depth": depth + 1})
             return new_id
@@ -1384,10 +1426,16 @@ class Orchestrator:
             return None
 
     # ---------- 辅助 ----------
-    _AUDIO_WORDS = ("配音", "声优", "语音", "台词", "念白", "念一遍", "音色", "音效",
-                    "bgm", "背景音乐", "朗读", "tts")
-    _IMAGE_WORDS = ("出图", "立绘", "头像", "图标", "卡面", "插画", "场景图", "画一张",
-                    "生成一张", "生成图片", "抠图", "重绘", "海报", "美术资源")
+    @classmethod
+    def _readonly_hint(cls) -> str:
+        """「需求」角色专用：后端已把工具表硬裁成只读，提示只描述能做什么。"""
+        return (
+            "## 本轮是只读分析（需求角色）\n"
+            "当前账号是「需求」角色：你可以读代码、检索内容、查文档，最后做汇报；"
+            "但**不能**改文件、删文件、执行命令、起服务或派发子agent——这些工具本轮不可用。\n"
+            "如果用户要求改代码，直接说明需求角色的只读限制，并给出「改哪里、怎么改、影响什么」"
+            "的建议，请开发角色执行。"
+        )
 
     @classmethod
     def _inspect_hint(cls) -> str:
@@ -1405,47 +1453,6 @@ class Orchestrator:
             "最后给出「结论 + 证据（文件:行号/日志原文）+ 建议改法」，"
             "本轮**不要**修改产品文件、不要起服务改配置。\n"
             "如果用户接着让你修，下一轮再动手改。"
-        )
-
-    @classmethod
-    def _intent_hint(cls, text: str) -> str:
-        """按用户这句话预判素材意图，生成前置硬提示（只放行"该生成就生成"）。
-
-        为什么在代码里做而不是只靠提示词：模型对"重新生成 cv"这类短句会本能地去翻仓库找脚本，
-        实测连翻 20+ 轮工具最后没产出任何音频；把意图和工具参数前置成结构化指令后能一轮出活。
-        """
-        import re as _re
-        t = (text or "").strip()
-        if not t:
-            return ""
-        low = t.lower()
-        is_audio = any(w in low for w in cls._AUDIO_WORDS) or bool(
-            _re.search(r"(?<![a-z])cv(?![a-z])", low))
-        is_image = any(w in low for w in cls._IMAGE_WORDS)
-        if not (is_audio or is_image):
-            return ""
-        if is_audio:
-            # 参数口径（text/voice/design_desc/out/items…）由 generate_audio 的工具定义给，
-            # 这里不再抄一遍：这段前置提示会拼进指令、随历史一直带着，抄一次就多背一次。
-            # 留着的是实测会犯的那几件事：绕去起服务/跑脚本，和翻一堆角色档案才动手。
-            return (
-                "## 意图判定（系统预判，优先级最高）\n"
-                "这是【音频/配音】需求（cv / 配音 / 语音都指配音）："
-                "第一步就直接调用 **generate_audio**。\n"
-                "严禁自己 start_service 起 IndexTTS2、curl 语音服务端口、"
-                "跑 cv_gen.py / gen-cv-indextts.py / cv-presets.py 或写脚本调语音接口"
-                "——语音服务由工具内部拉起，不用你管；用户要换声线/新音色也还是 "
-                "generate_audio（design_desc + preset_name，见工具说明）。\n"
-                "角色人设/台词最多读 1 个文件，拿到就生成；用户说「先看看再决定」"
-                "就出到 assets/audio/voice/ 试听，不要覆盖线上音频。"
-                "成功后汇报真实路径，失败如实说原因。"
-            )
-        return (
-            "## 意图判定（系统预判，优先级最高）\n"
-            "这是【图片】需求：第一步就直接调用 **generate_image** 生成真实图片文件"
-            "（参数以工具定义为准，reference 传参考图相对路径）。"
-            "禁止先翻仓库找脚本、禁止只回文字。\n"
-            "成功后汇报真实路径，失败如实说原因。"
         )
 
     # 多步需求的动词特征：命中即认为"不是一句话能答完"，要求先列计划
@@ -1508,40 +1515,7 @@ class Orchestrator:
             "禁止：自己选一个口径就当已确认、在正文里写「我按 X 处理（如不同意请告知）」蒙混过去。"
         )
 
-    async def _audio_capability_line(self, team_id: str) -> str:
-        """实时探测音频档位，生成能力清单里的那行。
-
-        为什么必须探测而不是写死：以前这里硬编码「占位模式 ⚠️」，即使团队配好了
-        IndexTTS2，模型看到的仍是"只有占位"，于是反复翻仓库找脚本、
-        最后把静音 wav 当成品上报。能力清单必须反映真实档位。
-        """
-        try:
-            prof = await self.resolve_media_profile(team_id, "audio")
-        except Exception:  # noqa: BLE001 - 探测失败按未配置处理
-            prof = {}
-        prov = (prof.get("provider") or "").lower()
-        params = prof.get("params") or {}
-        preset = params.get("preset") or params.get("voice") or ""
-        if prov in ("indextts2", "indextts", "local_tts"):
-            tail = f"，音色预设「{preset}」" if preset else ""
-            return ("- 已配置本地 IndexTTS2 零样本克隆{tail} → **可出真实人声**；"
-                    "配音一律直接调 generate_audio，产物落 assets/audio/voice/。".format(tail=tail))
-        if prov in ("openai_tts",):
-            return "- 已配置在线 TTS → **可出真实人声**；配音一律直接调 generate_audio。"
-        return ("- 未配置音频档位（设置 → 模型配置，kind=audio，再绑到助手的 "
-                "audio_profile）→ **占位模式 ⚠️：现在调 generate_audio 只会得到静音 wav。**"
-                "正确做法：第一步先告知用户「未配置真实音频供应商，需要先在设置里配置配音模型」，"
-                "并停在这一步等用户决定——不要为了交差生成一堆静音占位文件再上报；"
-                "用户明确说「先出占位也行」才继续生成，且产物必须如实标注占位。")
-
-    def _build_manifest(self, project, run_ctx: RunContext, python_bin: str,
-                        audio_line: str = "") -> str:
-        if COMFYUI_BASE_URL:
-            img_line = "- 已配置 ComfyUI 本地生图 → 可生成真实图片（端点不可用时自动回退占位并标注）"
-        else:
-            img_line = ("- 未配置图像供应商 → 占位模式 ⚠️：生成的是带标记的占位图，不是成品。"
-                        "先告知用户并等确认（「先出占位也行」才继续），不要闷头出占位图充数")
-        audio_line = audio_line or "- 占位模式 ⚠️ 只会生成静音占位 wav，不是成品"
+    def _build_manifest(self, project, run_ctx: RunContext, python_bin: str) -> str:
         return (
             "## 你当前可用的能力（系统实时探测，以此为准）\n"
             "### 代码执行\n- 原生模式（fs + shell）: ✅ 当前可用（主线）\n"
@@ -1549,8 +1523,6 @@ class Orchestrator:
             "需要外部资料（文档/报错/方案对比）时用，不要凭记忆编造网上事实\n"
             "（操作系统/shell/解释器/命令写法只在此处一份：见系统提示最前面的「运行环境」段，"
             "同一条命令失败两次就别再重试，换思路或如实上报）\n"
-            f"### 图片生成\n{img_line}\n"
-            f"### 音频\n{audio_line}\n"
             "### 项目环境\n"
             f"- 项目: {project.name}\n"
             f"- 构建: {project.commands_json.get('build', 'python -m compileall -q .')} · "
@@ -1569,15 +1541,14 @@ class Orchestrator:
             "图片直接进视野；不要读 base64、不要用 screenshot_page 开 file://（本地文件不走浏览器）\n"
             "- 快速校验: run_command 跑 build/test 命令（可用命令头见上方白名单；"
             "缺的命令让用户加进 .trace/allow_commands.txt）\n"
-            "判断规则：你要图/音频就 generate_image / generate_audio 直接生成；"
-            "改完代码默认只做静态验证（run_command 跑编译/构建/单测），别自己拉服务截图；"
+            "判断规则：改完代码默认只做静态验证（run_command 跑编译/构建/单测），别自己拉服务截图；"
             "用户明确要看效果、或同一问题多轮修改仍没解决时才起服务+截图核对；起服务换了几种方式仍起不来就停，"
             "把原因、试过的方法、风险点写进汇报；标 ❌/⚠️ 的能力要如实上报。\n"
             "### 大批量任务的正确做法（决定你会不会「只做到一半」）\n"
             "没有「这次先做多少条」的说法：清单还有没做完的项时，交卷 = 半成品。"
             "唯一的硬约束是 run_command 单条命令约 300 秒超时，所以：\n"
             "- 十几条以内：直接一条条做完。\n"
-            "- 几十上百条（全量配音/出图/批量改文件）：**写成脚本** —— 参数化、"
+            "- 几十上百条（批量改文件/批量整理）：**写成脚本** —— 参数化、"
             "跳过已完成项（断点续跑）、进度写进文件，然后 start_service 后台跑，"
             "用 service_logs 轮询到全部结束再收尾。脚本在后台自己循环，"
             "几百条也在同一次执行里跑完。\n"
@@ -1628,7 +1599,8 @@ class Orchestrator:
                 status = status or "succeeded"
             _aio.get_running_loop().create_task(_ch.notify_run_finished(
                 self._sf, run_id=str(run_ctx.run_id), team_id=run_ctx.team_id,
-                status=status, session_id=str(run_ctx.session_id) if run_ctx.session_id else None))
+                status=status, session_id=str(run_ctx.session_id) if run_ctx.session_id else None,
+                project_id=run_ctx.project_id))
         except Exception:  # noqa: BLE001 - 通道通知绝不影响 run
             log.exception("schedule channel notify failed")
 
@@ -1656,53 +1628,73 @@ class Orchestrator:
                 except Exception:  # noqa: BLE001
                     log.exception("close open task failed", extra={"task_id": str(t.id)})
 
-    async def _agent_profile_key(self, team_id: str, role: str) -> str | None:
-        return (await self._agent_defaults(team_id, role))[0]
+    async def _agent_profile_key(self, team_id: str, role: str,
+                                 project_id: str | None = None) -> str | None:
+        return (await self._agent_defaults(team_id, role, project_id))[0]
 
-    async def _agent_defaults(self, team_id: str, role: str) -> tuple[str | None, str]:
+    async def _agent_defaults(self, team_id: str, role: str,
+                              project_id: str | None = None) -> tuple[str | None, str]:
         """角色默认：绑定档位 key + 默认推理强度（agents.params_json.reasoning_effort）。
 
         为什么推理强度要跟着角色默认走（2026-11-14）：输入框右下角切换模型时会顺手把
         「模型 + 推理等级」写回角色默认，新会话/没单独选过的会话才和刚才那次选择一致；
         不认这个默认的话，设置页改了等于没改，用户看到的仍是端点默认强度。
+
+        project_id 非空时按「项目覆盖 → 团队默认 → 出厂」取值（团队版按项目配置智能体）。
         """
         async with self._sf() as s:
-            cfg = await get_agent_config(s, team_id, role)
+            cfg = await get_agent_config(s, team_id, role, project_id=project_id)
         params = cfg.params_json or {}
         return cfg.model_profile_key, _norm_effort(params.get("reasoning_effort"))
 
     async def _resolve_profile_key(self, team_id: str, role: str,
-                                   opts: dict, own_key: str | None = None) -> str | None:
-        """决定这次 run_agent 用哪个模型档位（None = 用 .env 全局兜底）。
+                                   opts: dict, own_key: str | None = None,
+                                   project_id: str | None = None) -> str | None:
+        """决定这次 run_agent 用哪个模型档位（None = 没绑定，交给上层判未就绪）。
 
-        优先级：输入框显式选择 > 本角色绑定 > （子agent）主agent 绑定 > 全局兜底。
+        优先级：项目绑定（管理员配置，强制） > 显式选择 > 本角色绑定 >
+        （子agent）主agent 绑定。
 
         为什么子agent 必须继承主agent 的档位：sub 角色通常没有自己的绑定（老安装里甚至
-        没有 sub 的 agents 行）。不继承就会 `_load_profile(None)` → {} → build_llm 掉回
-        .env 全局端点；而全局订阅常常已失效（403 SUBSCRIPTION_NOT_FOUND）。实测 2026-11-11：
-        一轮派出 6 个子agent 全部 403、主agent 却正常——根因正是主agent 走团队绑定档位
-        （211.101.244.244），子agent 掉到了 .env 里过期的 gonode.si 老订阅。
+        没有 sub 的 agents 行）。不继承就会拿到空档位；团队版没有 .env 全局兜底，
+        子agent 会在发请求前直接报「未绑定模型档位」。
         """
-        key = opts.get("model_profile_key") or own_key
+        key = None
+        if project_id:
+            try:
+                async with self._sf() as s:
+                    proj = await s.get(Project, _u(project_id))
+                key = (proj.model_profile_key if proj is not None else None) or None
+            except Exception:  # noqa: BLE001 - 项目档位查询失败走后续优先级
+                key = None
+        key = key or opts.get("model_profile_key") or own_key
         if not key and role == "sub":
             try:
-                key = await self._agent_profile_key(team_id, "main")
+                key = await self._agent_profile_key(team_id, "main", project_id)
             except Exception:  # noqa: BLE001 - 取主档位失败只影响子agent 的档位选择
                 key = None
         return key
 
-    async def _load_profile(self, team_id: str, profile_key: str | None) -> dict:
-        """解析角色绑定的 ModelProfile → Ctx.model_profile；未绑定返回 {}（用全局默认）。
+    async def _load_profile(self, team_id: str, profile_key: str | None,
+                            project_id: str | None = None) -> dict:
+        """解析角色绑定的 ModelProfile → Ctx.model_profile；未绑定返回 {}（上层判未就绪）。
 
-        取值优先级：档位 inline > 档位所绑供应商 > 环境变量（环境变量在 factory 兜底）。
-        供应商模式把 base_url/key 集中在 llm_providers，档位只选模型名；inline 仍可用，
-        便于临时试新端点而不改动供应商。
+        取值优先级：当前项目的专属档位 > 团队默认档位（档位被删/供应商停用即视为不可用，
+        不再回退环境变量）。档位内部：inline base_url/key > 所绑供应商。供应商模式把
+        base_url/key 集中在 llm_providers，档位只选模型名；inline 仍可用，便于临时试新端点。
         """
         if not profile_key:
             return {}
         async with self._sf() as s:
-            p = await s.scalar(select(ModelProfile).where(
-                ModelProfile.team_id == _u(team_id), ModelProfile.key == profile_key))
+            q = select(ModelProfile).where(
+                ModelProfile.team_id == _u(team_id), ModelProfile.key == profile_key)
+            if project_id:
+                p = await s.scalar(q.where(ModelProfile.project_id == _u(project_id)))
+            else:
+                p = None
+            if p is None:
+                # 项目里没建同名档位 → 回落团队默认（项目配置只覆盖需要改的部分）
+                p = await s.scalar(q.where(ModelProfile.project_id.is_(None)))
             if p is None:
                 # 绑定的档位已被删除却仍指向它 → 会静默回退到环境变量而踩 403；
                 # 显式告警，便于第一时间发现"删了档位没解绑角色"的问题。
@@ -1735,44 +1727,6 @@ class Orchestrator:
                     "api_key": params.get("api_key") or p.api_key_ref or api_key,
                     "provider": prov_label, "protocol": protocol,
                     "user_agent": user_agent, "params": params}
-
-    async def resolve_media_profile(self, team_id: str, kind: str) -> dict:
-        """解析媒体生成档位（kind: image|audio）：
-        main 角色 params_json.image_profile / audio_profile → 对应 ModelProfile。
-        返回 {provider, model, base_url, api_key, params}；未绑定返回 {}（走环境变量/占位）。"""
-        role = "main"
-        field = f"{kind}_profile"
-        prof: Optional[dict] = None
-        try:
-            async with self._sf() as s:
-                cfg = await get_agent_config(s, team_id, role)
-                pkey = (cfg.params_json or {}).get(field)
-                if pkey:
-                    p = await s.scalar(select(ModelProfile).where(
-                        ModelProfile.team_id == _u(team_id), ModelProfile.key == pkey,
-                        ModelProfile.kind == kind))
-                    if p is not None:
-                        params = p.params_json or {}
-                        prof = {"provider": (params.get("provider") or p.provider or "").lower(),
-                                "model": p.model, "base_url": p.base_url,
-                                "api_key": params.get("api_key") or p.api_key_ref,
-                                "params": params}
-        except Exception as e:  # noqa: BLE001 - 档位解析失败不影响生成主流程
-            # 以前这里静默返回 {}，导致"音色明明配好了却一直出静音占位"根本查不出来
-            # （真凶是 get_agent_config 的 str/UUID 不匹配，异常被吞）。至少留痕。
-            log.warning("resolve_media_profile(%s/%s) 失败：%s: %s",
-                        team_id, kind, type(e).__name__, e)
-        if prof is not None:
-            return prof
-        # 未绑定/解析失败 → 音频回退环境默认档位（v2 语义：档位是「显式覆盖」，
-        # 不绑也应能用本地默认语音服务）。2026-10-28 实测：角色合并后 main 行没绑
-        # audio_profile，这里返回 {} 被当成"未配置"，整批配音 0 失败却全是静音占位。
-        # 图像路径在 specialized 里本来就有 COMFYUI_BASE_URL 环境回退，维持不动。
-        if kind == "audio":
-            from game_agent.config import TTS_BASE_URL
-            return {"provider": "indextts2", "model": "", "base_url": TTS_BASE_URL,
-                    "api_key": "", "params": {}}
-        return {}
 
     @staticmethod
     def _attach_note(images: list[str], img_paths: list[str], files: list[dict],
@@ -1949,14 +1903,16 @@ class Orchestrator:
         if dropped:
             # 摘要式压缩：装不下的最早对话交给 AI 总结成摘要再注入，而非直接丢弃
             header = await self._summarize_dropped(team_id, lines[:dropped],
-                                                   dropped, len(lines))
+                                                   dropped, len(lines),
+                                                   project_id=project_id)
         history = "\n".join(picked)
         body = (f"## 会话上下文（旧→新）\n{history}\n\n## 本条用户需求{note}\n{req}"
                 if history else f"{req}{note}")
         return structure_block + env_block + notes_block + memory_block + body, images
 
     async def _summarize_dropped(self, team_id: str, dropped_lines: list[str],
-                                 dropped: int, total: int) -> str:
+                                 dropped: int, total: int,
+                                 project_id: str | None = None) -> str:
         """摘要式上下文压缩：把因窗口预算装不下的最早若干条对话交给 AI 总结成摘要，
         替代原来「已省略 N 条」的截断标注，让早期需求/结论不丢失。
         LLM 失败 / mock 模式 / 条数过少时退化为截断标注。"""
@@ -1976,7 +1932,9 @@ class Orchestrator:
                 f"【早期对话（旧→新）】\n{transcript}"
             )
             profile = await self._load_profile(
-                team_id, await self._agent_profile_key(team_id, "main"))
+                team_id,
+                await self._resolve_profile_key(team_id, "main", {}, project_id=project_id),
+                project_id=project_id)
             ctx = Ctx(
                 role="main", run_type="analyze", workspace="",
                 requirement=prompt, project_name="", commands={}, payload={},
@@ -2165,7 +2123,7 @@ class Orchestrator:
 
     @staticmethod
     def _brief_original_request(brief: str) -> str:
-        """从续跑说明里取回「上次请求原文」，供素材意图/计划提示判定。
+        """从续跑说明里取回「上次请求原文」，供意图/计划提示判定。
 
         续跑说明由 ``_BRIEF_PREFIX`` 开头，第二段是「上次请求原文：\\n<正文>」。
         取不到就返回空串（意图提示只是加分项，缺失不影响续跑本身）。
@@ -2390,7 +2348,10 @@ class Orchestrator:
                 return
             prompt = project_notes.judge_prompt(requirement or "", text, files,
                                                 project_notes.index_titles(workspace))
-            profile = await self._load_profile(team_id, await self._agent_profile_key(team_id, "main"))
+            profile = await self._load_profile(
+                team_id,
+                await self._resolve_profile_key(team_id, "main", {}, project_id=run_ctx.project_id),
+                project_id=run_ctx.project_id)
             ctx = Ctx(
                 role="main", run_type="memory", workspace="",
                 requirement=prompt, project_name="", commands={}, payload={},

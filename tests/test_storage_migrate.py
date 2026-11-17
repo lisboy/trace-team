@@ -141,6 +141,41 @@ def test_storage_info_picker_native_flag(api):
     assert isinstance(body["picker_native"], bool)
 
 
+# ---------------------------------------------------------------- GA_DATA_DIR 来源
+def test_env_file_data_dir_is_not_treated_as_pinned(pointer, tmp_path, monkeypatch):
+    """安装脚本把数据目录写进 .env：这不是「用户钉死」，界面/接口要允许迁移。"""
+    env_file = tmp_path / ".env"
+    env_file.write_text(f"GA_DATA_DIR={tmp_path / 'old'}\nGA_SECRET_KEY=x\n", encoding="utf-8")
+    monkeypatch.setattr(cfg, "_ENV_FILE", env_file)
+    monkeypatch.setattr(cfg, "_PRELOAD_DATA_DIR", "")
+    monkeypatch.setenv("GA_DATA_DIR", str(tmp_path / "old"))
+    assert cfg.data_dir_source() == "dotenv"
+
+    # 真正的环境变量（.env 里不是这个值）→ 迁移没用，得拒绝
+    monkeypatch.setenv("GA_DATA_DIR", str(tmp_path / "other"))
+    assert cfg.data_dir_source() == "env"
+
+    monkeypatch.delenv("GA_DATA_DIR")
+    cfg.write_data_dir_pointer(str(tmp_path / "via-pointer"))
+    assert cfg.data_dir_source() == "pointer"
+
+
+def test_rewrite_env_data_dir_keeps_other_lines(pointer, tmp_path, monkeypatch):
+    """迁移后改写 .env：只动 GA_DATA_DIR 一行，密钥等原样保留（否则登录态/库连接全废）。"""
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "# 注释\nGA_DATA_DIR=/old/dir\nGA_SECRET_KEY=secret\nDATABASE_URL=sqlite+aiosqlite:///x\n",
+        encoding="utf-8")
+    monkeypatch.setattr(cfg, "_ENV_FILE", env_file)
+
+    cfg.rewrite_env_data_dir("/mnt/data/TraceData")
+    text = env_file.read_text(encoding="utf-8")
+    assert "GA_DATA_DIR=/mnt/data/TraceData" in text
+    assert "GA_SECRET_KEY=secret" in text and "DATABASE_URL=sqlite+aiosqlite:///x" in text
+    assert "/old/dir" not in text
+    assert not (tmp_path / ".env.tmp").exists()
+
+
 # ---------------------------------------------------------------- 迁移进度
 def test_migrate_progress_shapes():
     """进度快照：扫描阶段不给百分比（前端显示不确定条），复制阶段按字节算，收尾到 100%。"""
@@ -230,6 +265,21 @@ def test_pick_dir_busy_and_unavailable(api, monkeypatch):
 
     monkeypatch.setattr(ui, "pick_directory", nope)
     assert request(api, "POST", "/api/system/storage/pick-dir", json={}).status_code == 501
+
+
+def test_pick_dir_headless_linux_raises_unavailable(monkeypatch):
+    """Linux 服务器（systemd/SSH，无 DISPLAY）不能去创建 Tk 窗口：
+    以前直接 tk.Tk() 抛 TclError「no display name」，路由按 500 记一条 ERROR 日志，
+    前端只能兜底。现在先判桌面会话，无 DISPLAY 直接 PickerUnavailable（→ 501）。"""
+    import sys
+    import game_agent.platform_ui as ui
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    assert ui.picker_supported() is False
+    with pytest.raises(ui.PickerUnavailable):
+        ui.pick_directory("选目录")
 
 
 # ---------------------------------------------------------------- 迁移：拒绝项
@@ -325,6 +375,79 @@ def test_migrate_back_to_default_clears_pointer(api):
     assert api["written"] == [""]
 
 
+def test_migrate_updates_env_file_when_data_dir_comes_from_dotenv(api, monkeypatch):
+    """Linux 包把数据目录写在 .env：迁移成功后必须同步改 .env，否则重启脚本还回旧目录。"""
+    _seed_data_dir(api["data_dir"])
+    rewritten: list[str] = []
+    monkeypatch.setattr(storage, "data_dir_source", lambda: "dotenv")
+    monkeypatch.setattr(storage, "env_file_path", lambda: Path(api["tmp"] / ".env"))
+    (api["tmp"] / ".env").write_text("GA_DATA_DIR=old\n", encoding="utf-8")
+    monkeypatch.setattr(storage, "rewrite_env_data_dir", lambda v: rewritten.append(v))
+
+    target = api["tmp"] / "newdisk" / "TraceData"
+    r = request(api, "POST", "/api/system/storage/migrate", json={"target_dir": str(target)})
+    assert r.status_code == 200, r.text
+    assert r.json()["env_file_updated"] is True
+    assert rewritten == [str(target)]
+    assert api["written"] == [str(target)]
+
+
+def _fake_local_db(api, monkeypatch, tmp_path):
+    """造一个「像内置 MariaDB」的数据目录，并把停/起库换成记录器。"""
+    src = api["data_dir"]
+    (src / "mysql" / "mysql").mkdir(parents=True, exist_ok=True)
+    (src / "mysql" / "ibdata1").write_bytes(b"innodb-data")
+    (src / "mysql_port").write_text("33306", encoding="utf-8")
+    monkeypatch.setattr(storage, "data_dir_source", lambda: "pointer")
+    monkeypatch.setattr(storage, "_local_db_dir", lambda: src / "mysql")
+    monkeypatch.setattr(storage, "_db_script", lambda: tmp_path / "db.sh")
+    return src
+
+
+def test_migrate_stops_and_restarts_local_db(api, monkeypatch, tmp_path):
+    """Linux 包：在线 datadir 不能直接复制——必须先停库、再复制、最后从新目录起库。"""
+    src = _fake_local_db(api, monkeypatch, tmp_path)
+    _seed_data_dir(src)
+    calls: list[tuple[str, Path]] = []
+    monkeypatch.setattr(storage, "_stop_local_db", lambda d: calls.append(("stop", Path(d))))
+    monkeypatch.setattr(storage, "_start_local_db", lambda d: calls.append(("start", Path(d))))
+
+    target = api["tmp"] / "newdisk" / "TraceData"
+    r = request(api, "POST", "/api/system/storage/migrate", json={"target_dir": str(target)})
+    assert r.status_code == 200, r.text
+    assert r.json()["moved_local_db"] is True
+    assert [c[0] for c in calls] == ["stop", "start"]
+    assert calls[0][1] == src.resolve()
+    assert calls[1][1] == target.resolve()
+    # 数据库文件也跟着搬过去了，普通文件也在
+    assert (target / "mysql" / "ibdata1").read_bytes() == b"innodb-data"
+    assert (target / "logs" / "app.log").read_text(encoding="utf-8") == "hello-log"
+    assert src.is_dir(), "迁移当刻旧目录（含旧库）必须保留"
+
+
+def test_migrate_restarts_old_db_when_new_one_fails(api, monkeypatch, tmp_path):
+    """新目录起库失败：旧库要立刻从旧目录重新拉起，指针不能写，半成品要清掉。"""
+    src = _fake_local_db(api, monkeypatch, tmp_path)
+    _seed_data_dir(src)
+    calls: list[tuple[str, Path]] = []
+    monkeypatch.setattr(storage, "_stop_local_db", lambda d: calls.append(("stop", Path(d))))
+
+    def fake_start(d):
+        calls.append(("start", Path(d)))
+        if Path(d) != src.resolve():
+            raise RuntimeError("端口没起来")
+
+    monkeypatch.setattr(storage, "_start_local_db", fake_start)
+
+    target = api["tmp"] / "newdisk" / "TraceData"
+    r = request(api, "POST", "/api/system/storage/migrate", json={"target_dir": str(target)})
+    assert r.status_code == 500
+    assert ("start", src.resolve()) in calls, "旧目录的库必须被重新拉起"
+    assert api["written"] == []
+    if target.exists():
+        assert list(target.iterdir()) == [], "失败后新目录里的半成品要清掉"
+
+
 # ---------------------------------------------------------------- 启动时清理旧目录
 def test_cleanup_old_data_dir_actually_deletes(tmp_path, monkeypatch):
     """迁移后重启删旧目录：这条以前是「静默不生效」（Path 没导入被 except 吞掉）。"""
@@ -357,6 +480,27 @@ def test_cleanup_old_data_dir_refuses_suspicious_targets(tmp_path, monkeypatch, 
     ga_main._cleanup_old_data_dir(_SilentLog())
     assert victim.exists(), f"{bad} 不该被删"
     assert not (new / cfg.PENDING_CLEANUP_FILENAME).exists(), "可疑标记也要清掉，别每次启动都试"
+
+
+def test_cleanup_refuses_old_dir_with_running_db(tmp_path, monkeypatch):
+    """旧目录里的内置 MariaDB 还活着时不能删（.env 没同步成功时重启仍会从旧目录起库）。"""
+    import os
+    import sys
+
+    if sys.platform == "win32":
+        pytest.skip("该护栏只针对 POSIX 内置 MariaDB")
+    from game_agent import main as ga_main
+
+    old = tmp_path / "old"
+    (old / "mysql").mkdir(parents=True)
+    (old / "mysql" / "mysqld.pid").write_text(str(os.getpid()), encoding="utf-8")
+    new = tmp_path / "new"
+    new.mkdir()
+    (new / cfg.PENDING_CLEANUP_FILENAME).write_text(str(old), encoding="utf-8")
+    monkeypatch.setattr(cfg, "DATA_DIR", new)
+
+    ga_main._cleanup_old_data_dir(_SilentLog())
+    assert old.exists(), "库还在跑，旧目录不能删"
 
 
 class _SilentLog:

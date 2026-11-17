@@ -1,12 +1,13 @@
 """运行自检：一眼看清「这一轮到底会不会走真实大模型、还差什么」。
 
-本程序只有一种运行方式：**永远调用真实大模型**。不存在 mock/离线演示模式。
-所以这里的判断只剩一件事——**有没有配好可用的供应商**（档位绑定 or .env 全局兜底）。
+本程序只有一种运行方式：**永远调用真实大模型**。团队版**没有 .env 全局兜底模型**：
+模型 / 地址 / Key 只能来自管理员绑定的模型档位（团队默认档位或项目绑定）。所以这里
+的判断只有一件事——**绑定的档位是否可用**。
 
 把结论算给前端用：
-  * 已绑定档位且能解析出 model/key/base_url → 就绪；
-  * 没绑档位 → 回退 .env 全局模型（配了 OPENAI_API_KEY 也算就绪）；
-  * 两者都没有 → 未就绪，明确提示「去设置 → 模型配置 添加供应商并绑定」。
+  * 团队默认档位可用，或至少有一个项目绑定了可用档位 → 就绪；
+  * 团队默认没绑、又有项目没绑档位 → 那些工作区里的对话会直接失败，列出来让管理员补；
+  * 一个可用档位都没有 → 未就绪，明确提示「去设置 → 模型配置 添加供应商并绑定」。
 
 只读，不发任何真实请求，不会额外花钱。
 """
@@ -24,13 +25,11 @@ router = APIRouter(prefix="/api", tags=["doctor"])
 
 async def llm_diagnostics(team_id: str) -> dict:
     """团队视角的 LLM 就绪度快照（供前端顶栏提示 / 设置页自检复用）。"""
-    from game_agent.config import LLM_MODEL, OPENAI_API_KEY, OPENAI_BASE_URL, ROLE_MODELS
-
     issues: list[str] = []
     hints: list[str] = []
 
-    # ---- 角色绑定档位 ----
-    from game_agent.db.models import Agent, LlmProvider, ModelProfile
+    # ---- 绑定档位 ----
+    from game_agent.db.models import Agent, LlmProvider, ModelProfile, Project
     from game_agent.db.session import SessionLocal
 
     bound_label = None
@@ -38,20 +37,36 @@ async def llm_diagnostics(team_id: str) -> dict:
     profile_ok = False
     profile_issue = None
     any_provider = False
+    unbound_projects: list[str] = []
     async with SessionLocal() as s:
         any_provider = (await s.scalar(
             select(LlmProvider.id).where(LlmProvider.team_id == _u(team_id)).limit(1))) is not None
         agent = await s.scalar(select(Agent).where(
             Agent.team_id == _u(team_id), Agent.key == "main"))
-        pkey = agent.model_profile_key if agent else None
+        team_key = agent.model_profile_key if agent else None
+        rows = (await s.execute(select(Project.id, Project.name, Project.model_profile_key).where(
+            Project.team_id == _u(team_id), Project.archived_at.is_(None)))).all()
+        # 团队默认档位优先；没有就取任一已绑定的项目档位作为就绪度样本。
+        pkey, sample_pid = team_key, None
         if not pkey:
-            profile_issue = "未绑定模型档位：会回退到 .env 的全局兜底模型。"
+            for pid, _name, key in rows:
+                if key:
+                    pkey, sample_pid = key, pid
+                    break
+        # 团队默认没绑时，没绑档位的项目都会在发消息时失败——列出来让管理员补。
+        if not team_key:
+            unbound_projects = [str(name) for _pid, name, key in rows if not key]
+        if not pkey:
+            profile_issue = "未绑定模型档位：还没有任何项目或智能体绑定模型。"
         else:
-            p = await s.scalar(select(ModelProfile).where(
-                ModelProfile.team_id == _u(team_id), ModelProfile.key == pkey))
+            q = select(ModelProfile).where(
+                ModelProfile.team_id == _u(team_id), ModelProfile.key == pkey)
+            p = (await s.scalar(q.where(ModelProfile.project_id == _u(sample_pid)))
+                 if sample_pid else None)
             if p is None:
-                profile_issue = (f"绑定的模型档位「{pkey}」已不存在（被删但没解绑）："
-                                 "运行时会静默回退到 .env 全局模型，极易 403。")
+                p = await s.scalar(q.where(ModelProfile.project_id.is_(None)))
+            if p is None:
+                profile_issue = f"绑定的模型档位「{pkey}」已不存在（被删但没解绑）。"
             else:
                 params = p.params_json or {}
                 base_url, api_key, prov_label, prov_enabled = p.base_url, None, None, True
@@ -78,35 +93,29 @@ async def llm_diagnostics(team_id: str) -> dict:
                 else:
                     profile_ok = True
 
-    fallback_has_key = bool(OPENAI_API_KEY)
-    ready = bool(profile_ok or fallback_has_key)
-
-    if profile_ok:
-        real_model = bound_model
-    else:
-        real_model = ROLE_MODELS.get("main") or LLM_MODEL
-        if profile_issue:
-            issues.append(profile_issue)
-        if not fallback_has_key:
-            if any_provider:
-                issues.append("而且 .env 全局兜底也没配 OPENAI_API_KEY —— 这一轮发不出任何真实请求。")
-            else:
-                issues.append("还没有配置任何大模型供应商（也没有 .env 全局 Key）—— 这一轮发不出任何真实请求。")
-            hints.append("去「设置 → 模型配置」添加一个供应商（填好地址和 Key），再到「设置 → 智能体」把"
-                         "「对话模型」绑到该档位即可；也可在聊天输入框右下角的模型选择器里直接选。")
+    ready = profile_ok
+    real_model = bound_model if profile_ok else None
+    if not profile_ok and profile_issue:
+        issues.append(profile_issue)
+    if unbound_projects:
+        shown = "、".join(unbound_projects[:5]) + (" 等" if len(unbound_projects) > 5 else "")
+        issues.append(f"这些工作区还没绑定模型档位，在里面发消息会直接失败：{shown}。")
+    if not (profile_ok and not unbound_projects):
+        if any_provider:
+            hints.append("供应商已经加好了：到「设置 → 智能体」把作用范围切到该项目，"
+                         "选一个已就绪的对话模型。")
         else:
-            hints.append(f"本轮将回退到 .env 全局模型「{real_model}」（地址 {OPENAI_BASE_URL}）。")
+            hints.append("去「设置 → 模型配置」添加一个供应商（填好地址和 Key），"
+                         "再到「设置 → 智能体」按团队默认或某个项目绑定模型即可。")
 
     return {
-        # ready = 这一轮确实能调到真实大模型
+        # ready = 这一轮确实能调到真实大模型（必须来自绑定档位，没有 .env 兜底）
         "ready": ready,
-        "configured": bool(profile_ok or fallback_has_key),
+        "configured": any_provider,
         "profile_ok": profile_ok,
         "profile_issue": profile_issue,
         "provider": bound_label,
         "model": real_model,
-        "fallback_model": ROLE_MODELS.get("main") or LLM_MODEL,
-        "fallback_has_key": fallback_has_key,
         "issues": issues,
         "hints": hints,
     }

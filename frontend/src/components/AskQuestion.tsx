@@ -94,7 +94,7 @@ export default function AskQuestion({
                     : "border-slate-200 bg-white/70 hover:border-slate-300"
                 }`}
               >
-                <input
+                <input autoComplete="off"
                   type="radio"
                   className="mt-1"
                   name={`q-${q.id}`}
@@ -111,7 +111,7 @@ export default function AskQuestion({
             ))}
           </div>
           {q.allow_text && (
-            <input
+            <input autoComplete="off"
               value={texts[q.id] || ""}
               onChange={(e) => setTexts((cur) => ({ ...cur, [q.id]: e.target.value }))}
               placeholder="输入你的答案（也可以补充要求）"

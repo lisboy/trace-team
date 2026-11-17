@@ -124,17 +124,17 @@ def test_explicit_analyze_has_no_soft_hint() -> None:
 def test_analyze_run_keeps_full_toolset() -> None:
     """轮次类型不裁工具：analyze 也给全量角色工具，用什么由模型自己判断。"""
     role_tools = ["read_file", "grep", "write_file", "edit_file", "run_command",
-                  "start_service", "generate_image"]
+                  "start_service", "view_image"]
     wl = effective_whitelist(role_tools, "analyze", None)
     assert set(wl) == set(role_tools)
 
 
 def test_caps_still_filter_tools() -> None:
     """用户手动的能力开关仍然硬裁剪（关掉联网就不给 web 工具）。"""
-    role_tools = ["read_file", "web_search", "web_fetch", "generate_image"]
+    role_tools = ["read_file", "web_search", "web_fetch", "view_image"]
     wl = effective_whitelist(role_tools, "modify", {"web": False})
     assert "web_search" not in wl and "web_fetch" not in wl
-    assert {"read_file", "generate_image"} <= set(wl)
+    assert {"read_file", "view_image"} <= set(wl)
 
 
 # ---------------------------------------------------------------- 显式「仅分析」仍生效

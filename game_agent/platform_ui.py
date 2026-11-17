@@ -154,13 +154,23 @@ def _pick_windows(title: str, *, selftest: bool = False) -> str:
 
 
 # --------------------------------------------------------------- tkinter 兜底
+def _has_display() -> bool:
+    """Linux 桌面会话才有 DISPLAY/WAYLAND_DISPLAY；服务器（systemd/SSH 无转发）没有。"""
+    if sys.platform.startswith("linux"):
+        return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    return True
+
+
 def _pick_tk(title: str) -> str:
     try:
         import tkinter as tk
         from tkinter import filedialog
     except Exception as e:  # noqa: BLE001
         raise PickerUnavailable(f"没有可用的图形界面库：{e}") from e
-    root = tk.Tk()
+    try:
+        root = tk.Tk()
+    except Exception as e:  # noqa: BLE001 - 无 DISPLAY / 显示服务连不上（远程服务器常见）
+        raise PickerUnavailable(f"这台机器没有可用的图形桌面：{e}") from e
     try:
         root.withdraw()
         try:
@@ -191,6 +201,11 @@ def pick_directory(title: str = "选择数据存放位置") -> str:
                     raise
                 # COM 弹不出来再退 tkinter（老系统/被安全软件拦 COM 时实测会走到这里）
                 return _pick_tk(title)
+        # 服务器部署（无桌面会话）别去碰 Tk：否则每次点「浏览…」都抛 TclError 刷 ERROR 日志，
+        # 前端只能当 500 处理。这里直接抛 PickerUnavailable → 501 → 前端回退内置目录浏览器。
+        if not _has_display():
+            raise PickerUnavailable("这台服务器没有图形桌面（DISPLAY 未设置），"
+                                    "弹不出系统文件夹窗口；请直接输入路径或用内置目录浏览器")
         return _pick_tk(title)
     finally:
         _PICK_LOCK.release()
@@ -200,6 +215,8 @@ def picker_supported() -> bool:
     """前端据此决定「浏览…」是按原生窗口还是回退内置目录浏览器。"""
     if sys.platform.startswith("win"):
         return True
+    if not _has_display():
+        return False
     try:
         import tkinter  # noqa: F401
         return True

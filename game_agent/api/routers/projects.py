@@ -1,6 +1,7 @@
 """空间 / 项目 路由（设计 §3 / §9）。"""
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -10,7 +11,9 @@ from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from game_agent.api.deps import _u, get_current_context, get_optional_context, require
+from game_agent.api.deps import (
+    _u, can_access_project, get_current_context, get_optional_context, require,
+)
 from game_agent.api.state import state
 from game_agent.auth.rbac import (
     PERM_PROJECT_CREATE, PERM_RUN_CREATE, PERM_TEAM_DELETE, PERM_VIEW,
@@ -150,7 +153,7 @@ async def reveal_project(project_id: str,
 async def get_project(project_id: str, ctx: RequestContext = Depends(require(PERM_VIEW))):
     async with state.session_factory() as s:
         p = await s.get(Project, _u(project_id))
-        if p is None or str(p.team_id) != ctx.team_id:
+        if p is None or str(p.team_id) != ctx.team_id or not can_access_project(ctx, project_id):
             raise HTTPException(status_code=404, detail="项目不存在")
         return {
             "id": str(p.id), "name": p.name, "slug": p.slug, "repo_path": p.repo_path,
@@ -161,41 +164,83 @@ async def get_project(project_id: str, ctx: RequestContext = Depends(require(PER
 
 
 # ---------------- 目录浏览（选择仓库文件夹） ----------------
-@router.get("/fs/dirs")
-async def list_dirs(path: str = Query(""), ctx: RequestContext = Depends(require(PERM_VIEW))):
-    """列出指定目录下的子文件夹（不含文件/隐藏目录），供「添加仓库」选择文件夹。
-
-    lite（本机）模式允许浏览任意位置；server 模式仅限 PROJECTS_ROOT 内。"""
+def _resolve_browse_target(path: str) -> Path:
+    """把前端传来的目录解析成可浏览的绝对路径；server 模式只允许 PROJECTS_ROOT 内。"""
     if MODE != "lite":
         base = PROJECTS_ROOT.resolve()
         target = ((base / path).resolve() if path else base)
         if not str(target).startswith(str(base)):
             raise HTTPException(status_code=400, detail="server 模式仅能浏览 PROJECTS_ROOT 内目录")
     else:
-        target = (Path(path).resolve() if path else PROJECTS_ROOT.resolve())
+        target = (Path(path).expanduser().resolve() if path else PROJECTS_ROOT.resolve())
     if not target.exists() or not target.is_dir():
         raise HTTPException(status_code=404, detail="目录不存在")
+    return target
+
+
+@router.get("/fs/dirs")
+async def list_dirs(path: str = Query(""), ctx: RequestContext = Depends(require(PERM_VIEW))):
+    """列出指定目录下的子文件夹（不含文件/隐藏目录），供「选择文件夹」用。
+
+    lite（本机）模式允许浏览任意位置；server 模式仅限 PROJECTS_ROOT 内。
+    顶层视图：Windows 附盘符；POSIX 附根目录入口——否则在 Linux 上内置浏览器
+    只能看到数据目录里面的子目录，按「上一级」也只是原地刷新，永远选不到别的盘。"""
+    target = _resolve_browse_target(path)
     entries: list[dict] = []
     if not path:
-        # 顶层视图：附盘符（Windows）便于跳到任意磁盘
-        for c in "CDEFGHIJKLMNOPQRSTUVWXYZ":
-            root = Path(f"{c}:\\")
-            if root.is_dir():
-                entries.append({"name": f"磁盘 {c}:", "path": str(root)})
+        if os.name == "nt":
+            for c in "CDEFGHIJKLMNOPQRSTUVWXYZ":
+                root = Path(f"{c}:\\")
+                if root.is_dir():
+                    entries.append({"name": f"磁盘 {c}:", "path": str(root)})
+        elif MODE == "lite":
+            entries.append({"name": "根目录 /", "path": "/"})
     try:
         for child in sorted(target.iterdir(), key=lambda p: p.name.lower()):
             if child.is_dir() and not child.name.startswith("."):
                 entries.append({"name": child.name, "path": str(child)})
     except PermissionError:
         pass  # 无权限目录静默跳过
-    return {"path": str(target), "parent": str(target.parent) if path else "", "dirs": entries}
+    parent = target.parent
+    return {"path": str(target), "parent": str(parent) if parent != target else "", "dirs": entries}
+
+
+class MkdirIn(BaseModel):
+    parent: str
+    name: str
+
+
+@router.post("/fs/mkdir")
+async def make_dir(body: MkdirIn, ctx: RequestContext = Depends(require(PERM_PROJECT_CREATE))):
+    """在内置目录浏览器里新建空文件夹（迁移数据时必须选一个空目录，Linux 上没有
+    像资源管理器那样的「新建文件夹」按钮）。"""
+    name = (body.name or "").strip()
+    if (not name or name.startswith(".") or name in (".", "..")
+            or any(ch in name for ch in ("/", "\\", "\x00"))):
+        raise HTTPException(status_code=400, detail="文件夹名不合法")
+    if len(name) > 64:
+        raise HTTPException(status_code=400, detail="文件夹名太长（最多 64 个字符）")
+    parent = _resolve_browse_target((body.parent or "").strip())
+    target = parent / name
+    if target.exists():
+        raise HTTPException(status_code=409, detail="同名文件夹已存在")
+    try:
+        target.mkdir()
+    except OSError as e:
+        raise HTTPException(status_code=400, detail=f"新建文件夹失败：{e}")
+    return {"path": str(target)}
 
 
 @router.get("/teams/{team_id}/projects")
 async def list_projects(team_id: str, archived: bool = Query(False),
                         ctx: RequestContext = Depends(require(PERM_VIEW))):
+    if team_id != ctx.team_id:
+        raise HTTPException(status_code=403, detail="不能查看其他团队的项目")
     async with state.session_factory() as s:
         q = select(Project).where(Project.team_id == _u(team_id))
+        # 开发/需求只能看到被分派到的项目；管理员看到全部
+        if ctx.role not in ("owner", "admin"):
+            q = q.where(Project.id.in_([_u(x) for x in ctx.project_ids]))
         q = q.where(Project.archived_at.is_not(None)) if archived else q.where(Project.archived_at.is_(None))
         q = q.order_by(Project.created_at.desc())  # 工作区按创建时间倒序：最新添加的排最上面
         rows = await s.execute(q)
@@ -205,12 +250,15 @@ async def list_projects(team_id: str, archived: bool = Query(False),
             cnt = await s.scalar(select(func.count()).select_from(Run).where(Run.project_id == p.id))
             out.append({"id": str(p.id), "name": p.name, "slug": p.slug,
                         "repo_path": p.repo_path, "run_count": cnt,
+                        "model_profile_key": p.model_profile_key,
                         "archived_at": str(p.archived_at) if p.archived_at else None})
         return out
 
 
 @router.get("/projects/{project_id}/runs")
 async def list_runs(project_id: str, ctx: RequestContext = Depends(require(PERM_VIEW))):
+    if not can_access_project(ctx, project_id):
+        raise HTTPException(status_code=404, detail="项目不存在")
     async with state.session_factory() as s:
         rows = await s.execute(select(Run).where(Run.project_id == _u(project_id))
                                .order_by(Run.created_at.desc()).limit(50))
@@ -543,9 +591,9 @@ _STOP_SCRIPTS = ("stop.bat",)
 
 
 async def _project_workspace(s, project_id: str, ctx: RequestContext):
-    """校验项目归属并返回工作区绝对路径（repo_path 兼容绝对路径）。"""
+    """校验项目归属 + 成员分派并返回工作区绝对路径（repo_path 兼容绝对路径）。"""
     p = await s.get(Project, _u(project_id))
-    if p is None or str(p.team_id) != ctx.team_id:
+    if p is None or str(p.team_id) != ctx.team_id or not can_access_project(ctx, project_id):
         raise HTTPException(status_code=404, detail="项目不存在")
     return (PROJECTS_ROOT / p.repo_path).resolve()
 

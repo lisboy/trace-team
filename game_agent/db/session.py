@@ -1,16 +1,23 @@
-"""异步引擎与会话工厂。个人版只跑 SQLite（单文件、零运维、随包即用）。"""
+"""异步引擎与会话工厂。
+
+团队版用 MySQL（Linux 包内置 MariaDB），SQLite 只留给本机调试与冒烟测试。
+两种方言共用一个 engine；SQLite 专用的 PRAGMA 只在 sqlite3 连接上执行。
+"""
 from __future__ import annotations
 
 import os
+import sqlite3
 from collections.abc import AsyncGenerator
 
+from sqlalchemy import event
+from sqlalchemy.engine import Engine as SyncEngine
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
 
-from game_agent.config import DATABASE_URL
+from game_agent.config import DATABASE_URL, is_sqlite
 from game_agent.db.models import Base
 
 # SQLite 落盘强度：NORMAL（默认，WAL 下只在 checkpoint fsync）| FULL（每事务 fsync，最安全）
@@ -18,20 +25,42 @@ _SQLITE_SYNC = os.environ.get("GA_SQLITE_SYNC", "NORMAL").strip().upper()
 if _SQLITE_SYNC not in ("NORMAL", "FULL"):
     _SQLITE_SYNC = "NORMAL"
 
+_pool_kwargs: dict = {}
+if not is_sqlite():
+    # MySQL 会在 wait_timeout（默认 8h）后单方面掐掉空闲连接；pre_ping 之外再做
+    # 定期回收，避免高峰期拿到死连接。团队并发不大，池子不需要开很大。
+    import multiprocessing
+
+    workers = max(1, int(os.environ.get("GA_WEB_WORKERS", "1") or 1))
+    _pool_kwargs = {
+        "pool_size": max(5, multiprocessing.cpu_count() * 2 // workers),
+        "max_overflow": 10,
+        "pool_recycle": 1800,
+        "pool_timeout": 30,
+        "connect_args": {"charset": "utf8mb4"},
+    }
+
 engine = create_async_engine(
     DATABASE_URL,
     echo=False,
     pool_pre_ping=True,
     future=True,
+    **_pool_kwargs,
 )
 
-# SQLite 单连接即可；开启外键约束
-from sqlalchemy import event  # noqa: E402
-from sqlalchemy.engine import Engine as SyncEngine  # noqa: E402
+
+def _is_sqlite_connection(con) -> bool:  # type: ignore[no-untyped-def]
+    if isinstance(con, sqlite3.Connection):
+        return True
+    # aiosqlite 走 SQLAlchemy 适配层，拿到的是 AsyncAdapt_aiosqlite_connection 而不是原生连接
+    return "sqlite" in type(con).__module__.lower()
 
 
 @event.listens_for(SyncEngine, "connect")
-def _fk_pragma(dbapi_con, con_record):  # type: ignore[no-untyped-def]
+def _sqlite_pragmas(dbapi_con, con_record):  # type: ignore[no-untyped-def]
+    # 这个监听器挂在全局 Engine 上，MySQL 连接也会走到这里；PRAGMA 在 MySQL 上是语法错误。
+    if not _is_sqlite_connection(dbapi_con):
+        return
     cur = dbapi_con.cursor()
     cur.execute("PRAGMA foreign_keys=ON")
     # WAL：默认的 rollback journal（journal_mode=delete）每次提交都要 fsync 主库 + 建/删
@@ -44,6 +73,7 @@ def _fk_pragma(dbapi_con, con_record):  # type: ignore[no-untyped-def]
                    "temp_store=MEMORY", "cache_size=-64000"):
         cur.execute(f"PRAGMA {pragma}")
     cur.close()
+
 
 SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 

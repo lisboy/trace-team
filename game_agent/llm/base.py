@@ -17,6 +17,15 @@ class LlmAuthError(RuntimeError):
     必须让 run 直接失败并明确提示用户。"""
 
 
+class LlmBadEndpoint(RuntimeError):
+    """端点地址/入口不对（3xx 重定向、404/405）：重试同一个 URL 永远不会好。
+
+    实测（2026-11-17 用户截图）：Base URL 填成了会 302 的站点入口，旧逻辑把 302
+    当普通错误退避重试 5 次，每次都要等满一轮；最终报「LLM HTTP 302: □□」，
+    既没说清原因，又让用户以为「连接失败就该一直重试」。
+    连接层没坏、Key 也未必错，错的是**地址**，所以单独一类、不消费重试次数。"""
+
+
 class LlmContextOverflow(RuntimeError):
     """端点明说「这次请求超过它的上下文上限」（HTTP 400 + 长度类报错）。
 

@@ -1,4 +1,4 @@
-"""素材：列表 / 重画 / 下载 / 导入 / 外置源拉取（设计 §7.8 / §7.9）。"""
+"""素材：列表 / 下载 / 导入 / 外置源拉取（设计 §7.8 / §7.9）。"""
 from __future__ import annotations
 
 import io
@@ -18,12 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from game_agent.api.deps import get_current_context, require
 from game_agent.api.state import state
 from game_agent.auth.rbac import PERM_AGENT_CONFIG, PERM_DOWNLOAD, PERM_VIEW
-from game_agent.assets.comfyui import ComfyUIError, generate_image_bytes as comfy_generate
-from game_agent.assets.placeholder import _parse_size, generate_placeholder_image
-from game_agent.config import (
-    COMFYUI_BASE_URL, COMFYUI_NEGATIVE_PROMPT, COMFYUI_TIMEOUT_S, COMFYUI_WORKFLOW_MODE,
-    PLACEHOLDER_ENABLED, PROJECTS_ROOT,
-)
+from game_agent.config import PROJECTS_ROOT
 from game_agent.core.context import RequestContext
 from game_agent.db.models import Artifact, AssetProvider, Project, Run, Session
 from game_agent.db.session import SessionLocal
@@ -188,63 +183,6 @@ async def artifact_session_sources(project_id: str | None = Query(None),
             q = q.where(Artifact.project_id == _u(project_id))
         rows = (await s.execute(q)).all()
         return [{"session_id": str(sid), "title": title} for sid, title in rows if sid]
-
-
-@router.post("/artifacts/{artifact_id}/regenerate")
-async def regenerate(artifact_id: str, ctx: RequestContext = Depends(require(PERM_AGENT_CONFIG))):
-    """素材库重画：配置了 ComfyUI 走真实生图（失败回退占位），否则占位重画。"""
-    async with SessionLocal() as s:
-        a = await s.get(Artifact, _u(artifact_id))
-        if a is None or str(a.team_id) != ctx.team_id:
-            raise HTTPException(status_code=404, detail="素材不存在")
-        if not PLACEHOLDER_ENABLED and not COMFYUI_BASE_URL:
-            raise HTTPException(status_code=400, detail="占位模式已关闭且无真实供应商")
-        # 重画走的是文生图/图生图管线，只能作用于图片类素材；音频/视频写进去会把文件类型弄乱
-        if a.asset_kind not in ("image", "icon"):
-            raise HTTPException(status_code=400,
-                                detail="只有图片素材支持「重画」；音频到「语音生成」、视频到「视频生成」里重新生成")
-        project = await s.get(Project, a.project_id)
-    workspace = PROJECTS_ROOT / project.repo_path
-    rel = a.rel_path
-    params = a.params_json or {}
-
-    comfy_err = ""
-    if COMFYUI_BASE_URL and a.asset_kind == "image":
-        try:
-            w, h = _parse_size(params.get("size", "512x256"))
-            # 重画以原图为参考图（img2img denoise=0.6）：保持角色/构图一致性；
-            # 原图缺失则退回纯文生图
-            ref_bytes: bytes | None = None
-            try:
-                old = (workspace / rel)
-                if old.is_file():
-                    ref_bytes = old.read_bytes()
-            except Exception:  # noqa: BLE001
-                ref_bytes = None
-            data = await comfy_generate(
-                params.get("prompt", ""), negative_prompt=COMFYUI_NEGATIVE_PROMPT,
-                width=w, height=h, base_url=COMFYUI_BASE_URL,
-                workflow_mode=COMFYUI_WORKFLOW_MODE,
-                timeout_s=COMFYUI_TIMEOUT_S, reference=ref_bytes,
-                reference_mode="img2img")
-            (workspace / rel).write_bytes(data)
-            async with SessionLocal() as s2:
-                row = await s2.get(Artifact, _u(artifact_id))
-                if row is not None:
-                    row.provider, row.is_placeholder, row.size = "comfyui", False, len(data)
-                    await s2.commit()
-            return {"ok": True, "rel_path": rel, "placeholder": False, "provider": "comfyui"}
-        except ComfyUIError as e:
-            comfy_err = str(e)
-            if not PLACEHOLDER_ENABLED:
-                raise HTTPException(status_code=502, detail=f"ComfyUI 生成失败：{comfy_err}")
-
-    info = generate_placeholder_image(str(workspace / rel), a.slug,
-                                     params.get("size", "512x256"),
-                                     params.get("transparent", False),
-                                     prompt=params.get("prompt", ""))
-    return {"ok": True, "rel_path": rel, "placeholder": True, "provider": "placeholder",
-            "note": f"ComfyUI 失败已回退占位：{comfy_err}" if comfy_err else ""}
 
 
 @router.get("/artifacts/{artifact_id}/file")

@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { api } from "../api";
-import { useAuth } from "../store";
+import { isAdminUser, useAuth } from "../store";
 import type { ProjectMemory, ProjectNote } from "../types";
 import ModelConfigTab, { loadModelConfig, type LlmProviderRow, type ModelProfileRow } from "../components/ModelConfigTab";
 import AppearanceTab from "../components/AppearanceTab";
@@ -9,7 +9,6 @@ import SystemLogs from "../components/SystemLogs";
 import ProfileTab from "../components/ProfileTab";
 import AssistantTab from "../components/AssistantTab";
 import StorageTab from "../components/StorageTab";
-import ChannelsTab from "../components/ChannelsTab";
 import SearchSelect from "../components/SearchSelect";
 
 const ROLE_NAMES: Record<string, string> = {
@@ -39,47 +38,74 @@ type Agent = {
   params_json: Record<string, any>;
   tools: string[];
   is_default: boolean;
+  /** 项目作用域下：true = 该角色在本项目没有覆盖行，展示的是团队默认/出厂值 */
+  inherited?: boolean;
+  prompt_inherited?: boolean;
+  model_inherited?: boolean;
+  project_id?: string | null;
 };
 type Profile = ModelProfileRow;
-type Provider = { id: string; driver_key: string; label: string; kind: string; enabled: boolean };
-export type ConfigTab = "profile" | "assistant" | "appearance" | "skills" | "agents" | "profiles" | "providers" | "memory" | "mcp" | "channels" | "storage" | "logs";
+export type ConfigTab = "profile" | "assistant" | "appearance" | "skills" | "agents" | "profiles" | "memory" | "mcp" | "storage" | "logs";
 
-/** 设置弹窗：盖在当前页上，左侧分类 + 右侧内容（对齐 Qoder 的设置对话框）。 */
-export default function Config({ onClose, initialTab }: { onClose?: () => void; initialTab?: ConfigTab }) {
+/** 「个人设置」是弹窗（点头像进入）；「设置」是独立菜单页（顶栏进入，仅管理员），
+ *  左侧分类 + 右侧内容，和对话/团队/用量一样占满内容区。 */
+export default function Config({ onClose, initialTab, mode = "personal", page = false }: {
+  onClose?: () => void;
+  initialTab?: ConfigTab;
+  mode?: "personal" | "team";
+  /** true = 作为菜单页渲染（不覆盖、不居中、不随 Esc 关闭） */
+  page?: boolean;
+}) {
   const currentTeamId = useAuth((s) => s.currentTeamId);
-  const [tab, setTab] = useState<ConfigTab>(initialTab || "appearance");
+  const isAdmin = useAuth((s) => isAdminUser(s.user));
+  const effectiveMode = mode === "team" && isAdmin ? "team" : "personal";
+  const [tab, setTab] = useState<ConfigTab>(
+    initialTab || (effectiveMode === "team" ? "profiles" : "profile"));
   const [agents, setAgents] = useState<Agent[]>([]);
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [llmProviders, setLlmProviders] = useState<LlmProviderRow[]>([]);
-  const [providers, setProviders] = useState<Provider[]>([]);
   const [editing, setEditing] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   const [msg, setMsg] = useState("");
+  // 作用范围："" = 团队默认；非空 = 该项目专属（提示词 / 参数 / 对话模型都跟随它）
+  // 带上 model_profile_key：项目作用域的「对话模型」就是项目绑定，直接在这里改。
+  const [projects, setProjects] = useState<{ id: string; name: string; model_profile_key?: string | null }[]>([]);
+  const [scopeProject, setScopeProject] = useState("");
+
+  function reloadProjects() {
+    if (!currentTeamId || !isAdmin) return Promise.resolve();
+    return api.projects(currentTeamId).then((ps: any[]) => {
+      setProjects((ps || []).map((p) => ({
+        id: p.id, name: p.name, model_profile_key: p.model_profile_key || null,
+      })));
+    }).catch(() => {});
+  }
+  useEffect(() => { void reloadProjects(); }, [currentTeamId, isAdmin]); // eslint-disable-line react-hooks/exhaustive-deps
 
   function refresh() {
-    api.agents().then((r) => setAgents(r.agents)).catch(() => {});
-    loadModelConfig().then((r) => {
+    if (!isAdmin) return;
+    api.agents(scopeProject).then((r) => setAgents(r.agents)).catch(() => {});
+    loadModelConfig(scopeProject).then((r) => {
       setProfiles(r.profiles);
       setLlmProviders(r.providers);
     }).catch(() => {});
-    api.providers().then(setProviders).catch(() => {});
   }
-  useEffect(refresh, [currentTeamId]);
+  useEffect(refresh, [currentTeamId, isAdmin, scopeProject]);
 
   useEffect(() => {
-    if (!onClose) return;
+    if (!onClose || page) return;
     const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, [onClose, page]);
 
   async function saveAgent(a: Agent) {
     setMsg("");
     try {
-      await api.updateAgent(a.key, {
-        system_prompt: draft,
-        model_profile_key: a.model_profile_key ?? "",
-      });
+      const body: any = { system_prompt: draft, project_id: scopeProject || null };
+      // 项目里模型仍是继承态时不要把它固化成覆盖（否则团队换模型本项目不跟）
+      if (!scopeProject || !a.model_inherited) body.model_profile_key = a.model_profile_key ?? "";
+      await api.updateAgent(a.key, body);
       setEditing(null);
       refresh();
       setMsg("已保存");
@@ -89,7 +115,11 @@ export default function Config({ onClose, initialTab }: { onClose?: () => void; 
   }
 
   async function bindModel(a: Agent, key: string) {
-    await api.updateAgent(a.key, { model_profile_key: key, system_prompt: a.system_prompt });
+    // 只传要改的字段：带上整段 system_prompt 会把「继承团队默认」变成一份显式拷贝
+    await api.updateAgent(a.key, {
+      model_profile_key: key,
+      project_id: scopeProject || null,
+    });
     refresh();
   }
 
@@ -100,30 +130,65 @@ export default function Config({ onClose, initialTab }: { onClose?: () => void; 
   async function bindProviderModel(a: Agent, providerId: string, model: string) {
     setMsg("");
     try {
-      const r: any = await api.autoModelProfile(providerId, model);
+      const r: any = await api.autoModelProfile(providerId, model, scopeProject);
       const key = r?.key || "";
       if (!key) { setMsg("未能创建模型档位"); return; }
-      await api.updateAgent(a.key, { model_profile_key: key, system_prompt: a.system_prompt });
+      await api.updateAgent(a.key, {
+        model_profile_key: key,
+        project_id: scopeProject || null,
+      });
       refresh();
     } catch (e: any) {
       setMsg(e?.message || "选择模型失败");
     }
   }
 
-  // 媒体档位绑定（美术→image_profile / 配音→audio_profile），存 agent.params_json
-  async function bindMedia(a: Agent, field: string, key: string) {
-    await api.updateAgent(a.key, {
-      system_prompt: a.system_prompt,
-      model_profile_key: a.model_profile_key ?? "",
-      params_json: { [field]: key },
-    });
-    refresh();
+  /** 项目作用域：对话模型写到项目的唯一绑定（projects.model_profile_key），
+   *  运行时优先级最高。以前这项只在「团队 → 项目与对话模型 → 配置」里能改，
+   *  这里只读展示，导致管理员不知道该信哪边；现在统一在这里设置。 */
+  async function bindProjectModel(key: string) {
+    if (!scopeProject) return;
+    setMsg("");
+    try {
+      await api.setProjectModel(scopeProject, key || null);
+      await reloadProjects();
+      refresh();
+      setMsg(key ? "已固定该项目的对话模型" : "已取消项目固定模型，回退到助手默认档位");
+    } catch (e: any) {
+      setMsg(e?.message || "保存项目模型失败");
+    }
+  }
+
+  async function bindProjectProviderModel(providerId: string, model: string) {
+    setMsg("");
+    try {
+      const r: any = await api.autoModelProfile(providerId, model, scopeProject);
+      const key = r?.key || "";
+      if (!key) { setMsg("未能创建模型档位"); return; }
+      await bindProjectModel(key);
+    } catch (e: any) {
+      setMsg(e?.message || "选择模型失败");
+    }
   }
 
   /** 默认推理强度（params_json.reasoning_effort）：输入框右下角切换「推理等级」时也写这里。
    *  只传 params_json，避免顺手覆盖 system_prompt / 打上「自定义提示词」标记。 */
   async function bindEffort(a: Agent, key: string) {
-    await api.updateAgent(a.key, { params_json: { reasoning_effort: key } });
+    await api.updateAgent(a.key, {
+      params_json: { reasoning_effort: key },
+      project_id: scopeProject || null,
+    });
+    refresh();
+  }
+
+  /** 恢复默认：团队作用域 = 删除团队行回到出厂词；项目作用域 = 删除项目覆盖、
+   *  重新继承团队默认（团队行不受影响）。 */
+  async function resetAgentScope(a: Agent) {
+    if (scopeProject) {
+      await api.dropAgentOverride(a.key, scopeProject);
+    } else {
+      await api.resetAgent(a.key);
+    }
     refresh();
   }
 
@@ -140,41 +205,62 @@ export default function Config({ onClose, initialTab }: { onClose?: () => void; 
     { v: "skills", label: "技能", icon: ico(<><circle cx="12" cy="12" r="4" /><path d="M12 3v3M12 18v3M3 12h3M18 12h3" /></>) },
     { v: "agents", label: "智能体", icon: ico(<><rect x="4" y="7" width="16" height="12" rx="2" /><path d="M12 3v4M9 12h.01M15 12h.01M9.5 16h5" /></>) },
     { v: "profiles", label: "模型配置", icon: ico(<><path d="M4 8h9M19 8h1M4 16h3M13 16h7" /><circle cx="16" cy="8" r="2.2" /><circle cx="10" cy="16" r="2.2" /></>) },
-    { v: "providers", label: "素材供应商", icon: ico(<><path d="M21 8 12 3 3 8v8l9 5 9-5z" /><path d="M3 8l9 5 9-5M12 13v8" /></>) },
     { v: "mcp", label: "MCP 服务器", icon: ico(<><rect x="3" y="4" width="18" height="7" rx="2" /><rect x="3" y="13" width="18" height="7" rx="2" /><path d="M7 7.5h.01M7 16.5h.01" /></>) },
-    { v: "channels", label: "消息通道", icon: ico(<><path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 9 9 0 0 1-3.9-.9L3 21l1.9-4.9A8.4 8.4 0 0 1 12 3a8.4 8.4 0 0 1 9 8.5z" /><path d="M8.5 11h.01M12 11h.01M15.5 11h.01" /></>) },
     { v: "memory", label: "项目记忆", icon: ico(<><path d="M4 5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2z" /><path d="M8 3v18M12 8h4M12 12h4" /></>) },
     { v: "storage", label: "存储空间", icon: ico(<><ellipse cx="12" cy="5" rx="8" ry="3" /><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5" /><path d="M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6" /></>) },
     { v: "logs", label: "系统日志", icon: ico(<><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M7 8h10M7 12h10M7 16h6" /></>) },
   ];
+  // 个人设置只有个人资料与外观；团队设置才是模型/智能体/技能等管理项（仅管理员）。
+  // 非管理员误入团队设置时自动降级为个人设置，避免看到管理入口。
+  const PERSONAL_TABS = CATS.filter((c) => c.v === "profile" || c.v === "appearance");
+  const TEAM_TABS = CATS.filter((c) => c.v !== "profile" && c.v !== "appearance");
+  const visibleCats = effectiveMode === "team" ? TEAM_TABS : PERSONAL_TABS;
+  useEffect(() => {
+    if (!visibleCats.some((c) => c.v === tab)) setTab(visibleCats[0]?.v || "profile");
+  }, [effectiveMode, tab]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4"
-      onClick={onClose}
-    >
-      <div
-        className="w-[min(1180px,94vw)] h-[86vh] bg-white rounded-lg shadow-xl flex flex-col overflow-hidden"
+  // 项目作用域的「对话模型」= projects.model_profile_key（运行时优先级最高），
+  // 就在下面这条下拉里直接改，团队页不再提供第二个入口。
+  const scopeProjectKey = projects.find((p) => p.id === scopeProject)?.model_profile_key || "";
+  const scopeProjectBound = scopeProjectKey
+    ? profiles.find((p) => p.key === scopeProjectKey) || null
+    : null;
+
+  const panel = (      <div
+        className={`bg-white flex flex-col overflow-hidden ${
+          page
+            ? "h-full w-full rounded-lg border border-slate-200"
+            : `h-[86vh] rounded-lg shadow-xl ${
+                effectiveMode === "team" ? "w-[min(1180px,94vw)]" : "w-[min(860px,94vw)]"
+              }`
+        }`}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="shrink-0 flex items-center gap-2 px-4 h-12 border-b border-slate-200 bg-slate-50">
-          <span className="font-semibold text-slate-700">设置</span>
-          <button
-            className="ml-auto p-1 rounded hover:bg-slate-200 text-slate-500"
-            onClick={onClose}
-            title="关闭设置（Esc）"
-            aria-label="关闭设置"
-          >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-              strokeWidth="2" strokeLinecap="round">
-              <path d="M18 6 6 18M6 6l12 12" />
-            </svg>
-          </button>
+          <span className="font-semibold text-slate-700">
+            {effectiveMode === "team" ? "设置" : "个人设置"}
+          </span>
+          <span className="text-[11px] text-slate-400">
+            {effectiveMode === "team" ? "团队级配置，仅管理员可改" : "头像 / 名称 / 密码 / 外观"}
+          </span>
+          {!page && (
+            <button
+              className="ml-auto p-1 rounded hover:bg-slate-200 text-slate-500"
+              onClick={onClose}
+              title="关闭设置（Esc）"
+              aria-label="关闭设置"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                strokeWidth="2" strokeLinecap="round">
+                <path d="M18 6 6 18M6 6l12 12" />
+              </svg>
+            </button>
+          )}
         </div>
 
         <div className="flex-1 flex overflow-hidden">
           <nav className="w-44 shrink-0 border-r border-slate-200 bg-slate-50 p-2 space-y-1 overflow-auto">
-            {CATS.map((c) => (
+            {visibleCats.map((c) => (
               <button
                 key={c.v}
                 onClick={() => setTab(c.v)}
@@ -191,6 +277,28 @@ export default function Config({ onClose, initialTab }: { onClose?: () => void; 
           </nav>
 
           <div className="flex-1 overflow-auto p-5">
+      {tab === "agents" && (
+        <div className="mb-3 flex items-center gap-2 flex-wrap bg-white border border-slate-200 rounded p-2.5">
+          <span className="text-xs text-slate-500">作用范围</span>
+          <SearchSelect
+            className="border rounded px-2 py-1 text-xs w-[240px]"
+            value={scopeProject}
+            title="选择配置作用范围：团队默认对所有项目生效；选中某个项目后，这里的提示词/参数/对话模型只对该项目生效（未单独设置的项自动继承团队默认）"
+            searchPlaceholder="搜索项目…"
+            options={[
+              { value: "", label: "团队默认（所有项目）" },
+              ...projects.map((p) => ({ value: p.id, label: `项目：${p.name}`, keywords: p.name })),
+            ]}
+            onChange={(v) => { setScopeProject(v); setEditing(null); setMsg(""); }}
+          />
+          <span className="text-[11px] text-slate-400 flex-1 min-w-[240px] leading-relaxed">
+            {scopeProject
+              ? "仅影响所选项目：提示词、参数、对话模型都只对这个项目生效；没单独设置的项自动继承团队默认。"
+              : "团队级默认配置，所有未单独配置的项目都按这里执行。"}
+          </span>
+        </div>
+      )}
+
       {msg && <div className="text-xs text-green-700 mb-2">{msg}</div>}
 
       {tab === "profile" && <ProfileTab />}
@@ -207,20 +315,19 @@ export default function Config({ onClose, initialTab }: { onClose?: () => void; 
 
       {tab === "mcp" && <McpTab />}
 
-      {tab === "channels" && <ChannelsTab />}
-
       {tab === "logs" && <SystemLogs open onClose={() => {}} embedded />}
 
       {tab === "agents" && (
         <div className="space-y-3">
           {agents.map((a) => {
-            const bound = profiles.find((p) => p.key === a.model_profile_key) || null;
+            // 项目作用域：对话模型写项目绑定（运行时同口径）；角色绑定只在项目未固定时兜底。
+            const projectBound = scopeProject ? scopeProjectBound : null;
+            const roleBound = profiles.find((p) => p.key === a.model_profile_key
+              && ((p.project_id || "") === scopeProject)) ||
+              profiles.find((p) => p.key === a.model_profile_key) || null;
+            const bound = projectBound || roleBound;
             // 对话档位才能当"大脑"：不过滤的话助手能绑上一个出图档位，运行时报模型不存在
             const llmProfiles = profiles.filter((p) => (p.kind || "llm") === "llm");
-            const imageProfiles = profiles.filter((p) => p.kind === "image");
-            const audioProfiles = profiles.filter((p) => p.kind === "audio");
-            const boundImage = imageProfiles.find((p) => p.key === a.params_json?.image_profile) || null;
-            const boundAudio = audioProfiles.find((p) => p.key === a.params_json?.audio_profile) || null;
             // 「对话模型」下拉直接列出「供应商 → 模型目录」，选中即自动建档位并绑定。
             // 以前只列已有档位(llmProfiles)，新加的供应商就算拉到了模型也一个都不出现，
             // 用户以为「配了模型却选不了」。已建档位的模型显示为「已就绪」。
@@ -234,7 +341,9 @@ export default function Config({ onClose, initialTab }: { onClose?: () => void; 
                 const sig = pv.id + "\u0000" + name;
                 if (seenModel.has(sig)) continue;
                 seenModel.add(sig);
-                const exist = llmProfiles.find((p) => p.provider_id === pv.id && p.model === name);
+                const exist = llmProfiles.find((p) => p.provider_id === pv.id
+                  && p.model === name && ((p.project_id || "") === scopeProject)) ||
+                  llmProfiles.find((p) => p.provider_id === pv.id && p.model === name);
                 modelRows.push({ pid: pv.id, plabel: pv.label, model: name, key: exist?.key || "" });
               }
             }
@@ -244,47 +353,83 @@ export default function Config({ onClose, initialTab }: { onClose?: () => void; 
                 <span className="font-medium">{ROLE_NAMES[a.key] || a.key}</span>
                 <span className="text-[11px] mono text-slate-400">{a.key}</span>
                 {a.is_default && <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-500">默认</span>}
+                {scopeProject && a.inherited && (
+                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-sky-50 text-sky-700"
+                    title="该项目没有单独配置这个角色，当前展示并执行的是团队默认配置">
+                    继承团队默认
+                  </span>
+                )}
+                {scopeProject && !a.inherited && a.prompt_inherited && (
+                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-500"
+                    title="该项目只覆盖了参数，提示词仍跟随团队默认">提示词继承</span>
+                )}
+                {/* 对话模型：团队作用域 = 角色默认档位；项目作用域 = 项目固定档位
+                    （运行时优先级最高）。两个作用域都在这一个下拉里改。 */}
                 <div className="ml-auto flex items-center gap-2 text-sm flex-wrap">
-                  {/* 默认对话模型：写入 agents.model_profile_key。输入框右下角选择器选「跟随默认」时
-                      就走这里的档位；不绑则回退到 .env 全局模型。以前这里只是只读提示、只能去输入框
-                      选，导致「选完模型自检仍报未绑定档位」——现在直接给下拉能绑。 */}
-                  <label className="text-xs text-slate-500 flex items-center gap-1" title="输入框右下角选「跟随默认」时用这个档位；不绑则走 .env 全局模型">
-                    对话模型
-                    <SearchSelect
-                      className="border rounded px-2 py-1 text-xs w-[200px]"
-                      value={a.model_profile_key ?? ""}
-                      title="选择要用的对话模型：列的是各供应商已拉取的模型；选中会自动建档位并绑定。不绑则走 .env 全局模型"
-                      searchPlaceholder="搜索模型…"
-                      options={[
-                        { value: "", label: "跟随 .env 全局（不绑定）" },
-                        ...modelRows.map((r) => ({
-                          value: r.key || `pm:${r.pid}:${r.model}`,
-                          label: `${r.model}${r.key ? "（已就绪）" : ""}`,
-                          keywords: `${r.model} ${r.plabel || ""}`,
-                          group: r.plabel || "供应商",
-                        })),
-                        ...(bound && !modelRows.some((r) => r.key === a.model_profile_key)
-                          ? [{
-                              value: a.model_profile_key ?? "",
-                              label: `${bound.label}${bound.model ? ` · ${bound.model}` : ""}${bound.provider_id ? "（供应商已停用）" : ""}`,
-                            }]
-                          : []),
-                      ]}
-                      onChange={(v) => {
-                        if (!v) { bindModel(a, ""); return; }
-                        // 已有档位（含历史档位）→ 直接绑
-                        if (llmProfiles.some((p) => p.key === v)) { bindModel(a, v); return; }
-                        // 供应商模型目录里的模型 → 自动建档位再绑
-                        if (v.startsWith("pm:")) {
-                          const rest = v.slice(3);
-                          const i = rest.indexOf(":");
-                          bindProviderModel(a, rest.slice(0, i), rest.slice(i + 1));
-                          return;
-                        }
-                        bindModel(a, v);
-                      }}
-                    />
-                  </label>
+                  {(() => {
+                    const modelValue = scopeProject ? scopeProjectKey : (a.model_profile_key ?? "");
+                    const pick = (key: string) =>
+                      (scopeProject ? bindProjectModel(key) : bindModel(a, key));
+                    const pickProvider = (pid: string, model: string) =>
+                      (scopeProject ? bindProjectProviderModel(pid, model)
+                        : bindProviderModel(a, pid, model));
+                    return (
+                      <label className="text-xs text-slate-500 flex items-center gap-1"
+                        title={scopeProject
+                          ? "项目固定对话模型：绑定后这个项目里所有对话都用它，运行时以它为准；不固定 = 用团队默认作用域里的助手默认档位"
+                          : "团队默认对话模型：未单独绑定模型的项目用它；不绑则该项目没有可用模型"}>
+                        对话模型
+                        <SearchSelect
+                          className="border rounded px-2 py-1 text-xs w-[210px]"
+                          value={modelValue}
+                          title="列的是各供应商已拉取的模型：选中会自动建档位并绑定"
+                          searchPlaceholder="搜索模型…"
+                          options={[
+                            { value: "", label: scopeProject ? "不固定（用助手默认档位）" : "不绑定（未就绪）" },
+                            ...modelRows.map((r) => ({
+                              value: r.key || `pm:${r.pid}:${r.model}`,
+                              label: `${r.model}${r.key ? "（已就绪）" : ""}`,
+                              keywords: `${r.model} ${r.plabel || ""}`,
+                              group: r.plabel || "供应商",
+                            })),
+                            ...(modelValue && bound && !modelRows.some((r) => r.key === modelValue)
+                              ? [{
+                                  value: modelValue,
+                                  label: `${bound.label}${bound.model ? ` · ${bound.model}` : ""}${bound.provider_id ? "（供应商已停用）" : ""}`,
+                                }]
+                              : []),
+                          ]}
+                          onChange={(v) => {
+                            if (!v) { pick(""); return; }
+                            // 已有档位（含历史档位）→ 直接绑
+                            if (llmProfiles.some((p) => p.key === v)) { pick(v); return; }
+                            // 供应商模型目录里的模型 → 自动建档位再绑
+                            if (v.startsWith("pm:")) {
+                              const rest = v.slice(3);
+                              const i = rest.indexOf(":");
+                              pickProvider(rest.slice(0, i), rest.slice(i + 1));
+                              return;
+                            }
+                            pick(v);
+                          }}
+                        />
+                      </label>
+                    );
+                  })()}
+                  {scopeProject && (
+                    <span className={`text-[11px] ${projectBound ? "text-emerald-700" : (roleBound && !scopeProjectKey) ? "text-slate-400" : "text-rose-600"}`}>
+                      {projectBound
+                        ? "项目固定（所有角色）"
+                        : scopeProjectKey
+                          ? "项目绑定的档位已不存在，请重选"
+                          : (roleBound ? "未固定，用助手默认档位" : "未固定，且助手默认档位未绑 → 无法对话")}
+                    </span>
+                  )}
+                  {modelRows.length === 0 && (
+                    <span className="text-[11px] text-amber-600">
+                      还没有可用模型：先去「模型配置」加供应商并拉取模型
+                    </span>
+                  )}
                   <label className="text-xs text-slate-500 flex items-center gap-1"
                     title="默认推理强度：输入框右下角切换「推理等级」会写回这里；不指定=走模型端点默认">
                     推理等级
@@ -304,50 +449,19 @@ export default function Config({ onClose, initialTab }: { onClose?: () => void; 
                       onChange={(v) => bindEffort(a, v)}
                     />
                   </label>
-                  <label className="text-xs text-slate-500 flex items-center gap-1">美术模型
-                    <SearchSelect
-                      className="border rounded px-2 py-1 text-xs w-[130px]"
-                      value={a.params_json?.image_profile ?? ""}
-                      title="选择美术（图像生成）模型档位"
-                      searchPlaceholder="搜索档位…"
-                      options={[
-                        { value: "", label: "默认（ComfyUI 环境变量）" },
-                        ...imageProfiles.map((p) => ({ value: p.key, label: p.label, keywords: p.label })),
-                        ...(boundImage && !imageProfiles.some((p) => p.key === a.params_json?.image_profile)
-                          ? [{ value: a.params_json?.image_profile ?? "", label: `${a.params_json?.image_profile}（已失效）` }]
-                          : []),
-                      ]}
-                      onChange={(v) => bindMedia(a, "image_profile", v)}
-                    />
-                  </label>
-                  <label className="text-xs text-slate-500 flex items-center gap-1">配音模型
-                    <SearchSelect
-                      className="border rounded px-2 py-1 text-xs w-[130px]"
-                      value={a.params_json?.audio_profile ?? ""}
-                      title="选择配音（音频生成）模型档位"
-                      searchPlaceholder="搜索档位…"
-                      options={[
-                        { value: "", label: "默认（占位模式）" },
-                        ...audioProfiles.map((p) => ({ value: p.key, label: p.label, keywords: p.label })),
-                        ...(boundAudio && !audioProfiles.some((p) => p.key === a.params_json?.audio_profile)
-                          ? [{ value: a.params_json?.audio_profile ?? "", label: `${a.params_json?.audio_profile}（已失效）` }]
-                          : []),
-                      ]}
-                      onChange={(v) => bindMedia(a, "audio_profile", v)}
-                    />
-                  </label>
                   <button
                     className="text-xs px-2 py-1 rounded border border-slate-200 hover:bg-slate-50"
                     onClick={() => { setEditing(editing === a.key ? null : a.key); setDraft(a.system_prompt); }}
                   >
                     {editing === a.key ? "收起" : "编辑 Prompt"}
                   </button>
-                  {!a.is_default && (
+                  {(scopeProject ? !a.inherited : !a.is_default) && (
                     <button
                       className="text-xs px-2 py-1 rounded border border-slate-200 hover:bg-slate-50 text-red-600"
-                      onClick={async () => { await api.resetAgent(a.key); refresh(); }}
+                      title={scopeProject ? "删除该项目的覆盖，恢复继承团队默认" : "删除团队默认配置，恢复出厂提示词"}
+                      onClick={() => resetAgentScope(a)}
                     >
-                      重置
+                      {scopeProject ? "恢复继承" : "重置"}
                     </button>
                   )}
                 </div>
@@ -366,15 +480,15 @@ export default function Config({ onClose, initialTab }: { onClose?: () => void; 
                       <span className="text-slate-400"> · </span>
                       <span>{bound.provider_label
                         ? `供应商 ${bound.provider_label}`
-                        : bound.base_url ? `内联地址 ${bound.base_url}` : "供应商未绑（走环境变量）"}</span>
+                        : bound.base_url ? `内联地址 ${bound.base_url}` : "供应商未绑（档位不可用）"}</span>
                       {!bound.provider_id && !bound.base_url && (
                         <span className="ml-1 text-[10px] px-1.5 py-0.5 rounded bg-amber-50 text-amber-700">
-                          没有密钥来源，将使用环境变量默认
+                          没有密钥来源，该档位不可用
                         </span>
                       )}
                     </>
                   ) : (
-                    <span className="text-slate-400">全局默认（环境变量）</span>
+                    <span className="text-rose-600">未绑定（没有可用模型）</span>
                   )}
                   <span className="text-slate-400"> · </span>
                   <span title="默认推理强度（输入框右下角切换会写回这里）">
@@ -382,20 +496,6 @@ export default function Config({ onClose, initialTab }: { onClose?: () => void; 
                       ? <span className="mono text-slate-700">{EFFORT_LABELS[a.params_json.reasoning_effort] || a.params_json.reasoning_effort}</span>
                       : <span className="text-slate-400">端点默认</span>}
                   </span>
-                </span>
-                <span>
-                  美术：{boundImage ? (
-                    <span className="mono text-slate-700">{boundImage.model || boundImage.label}</span>
-                  ) : (
-                    <span className="text-slate-400">ComfyUI 环境变量</span>
-                  )}
-                </span>
-                <span>
-                  配音：{boundAudio ? (
-                    <span className="mono text-slate-700">{boundAudio.model || boundAudio.label}</span>
-                  ) : (
-                    <span className="text-slate-400">占位模式（未配置）</span>
-                  )}
                 </span>
               </div>
               {editing === a.key && (
@@ -420,82 +520,18 @@ export default function Config({ onClose, initialTab }: { onClose?: () => void; 
       {tab === "profiles" && (
         <ModelConfigTab profiles={profiles} providers={llmProviders} refresh={refresh} />
       )}
-
-      {tab === "providers" && <ProvidersTab providers={providers} refresh={refresh} />}
           </div>
         </div>
       </div>
-    </div>
   );
-}
 
-function ProvidersTab({ providers, refresh }: { providers: Provider[]; refresh: () => void }) {
-  const [specs, setSpecs] = useState<any[]>([]);
-  const [sel, setSel] = useState("");
-  const [label, setLabel] = useState("");
-  const [conf, setConf] = useState("{}");
-  const [err, setErr] = useState("");
-
-  useEffect(() => {
-    api.driverSpecs().then((r) => {
-      setSpecs(r.drivers);
-      if (r.drivers.length) setSel(r.drivers[0].key);
-    }).catch(() => {});
-  }, []);
-
-  const spec = specs.find((d) => d.key === sel);
-
-  async function add() {
-    setErr("");
-    try {
-      const config_json = JSON.parse(conf || "{}");
-      await api.createProvider({
-        driver_key: sel, label: label || sel,
-        kind: spec?.kind || "image", enabled: true, config_json,
-      });
-      setLabel("");
-      setConf("{}");
-      refresh();
-    } catch (e: any) {
-      setErr(e?.message?.includes("JSON") ? "配置 JSON 格式错误" : e?.message || "添加失败");
-    }
-  }
-
+  if (page) return <div className="h-full bg-slate-100 p-4">{panel}</div>;
   return (
-    <div>
-      <div className="bg-white rounded border border-slate-200 p-4 mb-4 text-sm">
-        <div className="grid grid-cols-2 gap-3">
-          <select className="border rounded px-2 py-1" value={sel} onChange={(e) => setSel(e.target.value)}>
-            {specs.map((d) => (
-              <option key={d.key} value={d.key}>{d.label}（{d.kind}）</option>
-            ))}
-          </select>
-          <input className="border rounded px-2 py-1" placeholder="显示名" value={label} onChange={(e) => setLabel(e.target.value)} />
-        </div>
-        {spec && (
-          <div className="mt-2 text-[11px] text-slate-400">
-            配置字段：{(spec.config_schema?.properties && Object.keys(spec.config_schema.properties).join(", ")) || "无"}
-          </div>
-        )}
-        <textarea className="w-full h-20 border rounded p-2 text-xs mono mt-2" value={conf} onChange={(e) => setConf(e.target.value)} />
-        <div className="mt-2">
-          <button className="ga-btn ga-btn-primary" onClick={add}>添加供应商</button>
-          {err && <span className="text-xs text-red-600 ml-2">{err}</span>}
-        </div>
-      </div>
-      <div className="space-y-2">
-        {providers.map((p) => (
-          <div key={p.id} className="bg-white rounded border border-slate-200 p-3 flex items-center gap-3 text-sm">
-            <span className="font-medium">{p.label}</span>
-            <span className="text-[11px] mono text-slate-400">{p.driver_key}</span>
-            <span className={`text-[10px] px-1.5 py-0.5 rounded ${p.enabled ? "bg-green-100 text-green-700" : "bg-slate-100 text-slate-400"}`}>
-              {p.enabled ? "启用" : "停用"}
-            </span>
-            <button className="ml-auto ga-btn ga-btn-danger ga-btn-sm" onClick={async () => { await api.deleteProvider(p.id); refresh(); }}>删除</button>
-          </div>
-        ))}
-        {providers.length === 0 && <div className="text-sm text-slate-400">暂无供应商；未配置时图像/音频使用本地占位生成。</div>}
-      </div>
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4"
+      onClick={onClose}
+    >
+      {panel}
     </div>
   );
 }
@@ -587,17 +623,20 @@ function McpTab() {
         </div>
         {projectId && (
           <div className="grid grid-cols-2 gap-2">
-            <input className="border rounded px-2 py-1 text-xs" placeholder="名称（如 fs、browser）"
+            <input autoComplete="off" className="border rounded px-2 py-1 text-xs" placeholder="名称（如 fs、browser）"
               value={form.name} disabled={!!form.id}
               onChange={(e) => setForm({ ...form, name: e.target.value })} />
-            <select className="border rounded px-2 py-1 text-xs" value={form.transport}
-              onChange={(e) => setForm({ ...form, transport: e.target.value })}>
-              <option value="stdio">stdio（本地进程）</option>
-              <option value="http">http（远程 URL）</option>
-            </select>
+            <SearchSelect className="border rounded px-2 py-1 text-xs bg-white w-full" rootClassName="w-full"
+              value={form.transport}
+              onChange={(v) => setForm({ ...form, transport: v })}
+              title="传输方式" searchPlaceholder="搜索传输方式…" panelMinWidth={200}
+              options={[
+                { value: "stdio", label: "stdio（本地进程）" },
+                { value: "http", label: "http（远程 URL）" },
+              ]} />
             {form.transport === "stdio" ? (
               <>
-                <input className="border rounded px-2 py-1 text-xs col-span-2"
+                <input autoComplete="off" className="border rounded px-2 py-1 text-xs col-span-2"
                   placeholder='command（如 npx / python）'
                   value={form.command}
                   onChange={(e) => setForm({ ...form, command: e.target.value })} />
@@ -609,11 +648,11 @@ function McpTab() {
                   value={envText} onChange={(e) => setEnvText(e.target.value)} />
               </>
             ) : (
-              <input className="border rounded px-2 py-1 text-xs col-span-2" placeholder="MCP 端点 URL"
+              <input autoComplete="off" className="border rounded px-2 py-1 text-xs col-span-2" placeholder="MCP 端点 URL"
                 value={form.url} onChange={(e) => setForm({ ...form, url: e.target.value })} />
             )}
             <label className="flex items-center gap-1.5 text-xs text-slate-600">
-              <input type="checkbox" checked={form.enabled}
+              <input autoComplete="off" type="checkbox" checked={form.enabled}
                 onChange={(e) => setForm({ ...form, enabled: e.target.checked })} />
               启用
             </label>
@@ -798,7 +837,7 @@ function MemoryTab() {
         </div>
         {projectId && (
           <div className="flex gap-2">
-            <input
+            <input autoComplete="off"
               className="flex-1 border rounded px-2 py-1 text-xs"
               placeholder="手动补充一条项目记忆，如：美术风格为像素风、配色以深蓝为主"
               value={draft}

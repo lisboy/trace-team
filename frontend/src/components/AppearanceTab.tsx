@@ -40,7 +40,7 @@ function Slider({ label, value, min, max, step = 1, unit, onChange }: {
         <span>{label}</span>
         <span className="mono text-slate-400">{value}{unit}</span>
       </span>
-      <input
+      <input autoComplete="off"
         type="range"
         className="w-full accent-brand-600"
         min={min}
@@ -164,7 +164,7 @@ function WePicker({ onPick }: { onPick: (src: string, video: boolean) => void })
         )}
       </div>
       <div className="flex gap-2">
-        <input
+        <input autoComplete="off"
           className="flex-1 border rounded px-2 py-1 text-xs"
           placeholder="手填工坊目录（可选，留空用自动探测）"
           value={rootInput}
@@ -194,7 +194,7 @@ function WePicker({ onPick }: { onPick: (src: string, video: boolean) => void })
       </div>
       {msg && <div className="text-xs text-red-600">{msg}</div>}
       {items.length > 0 && (
-        <input
+        <input autoComplete="off"
           className="w-full border rounded px-2 py-1 text-xs"
           placeholder={`筛选壁纸（共 ${items.length} 个${items.length > 120 ? "，只显示前 120 个" : ""}）`}
           value={q}
@@ -289,7 +289,7 @@ export default function AppearanceTab() {
                 onClick={() => update({ accent: a.hex })}
               />
             ))}
-            <input
+            <input autoComplete="off"
               type="color"
               value={/^#[0-9a-f]{6}$/i.test(prefs.accent) ? prefs.accent : "#1f5fd0"}
               onChange={(e) => update({ accent: e.target.value })}
@@ -313,7 +313,7 @@ export default function AppearanceTab() {
           ))}
         </div>
         {prefs.bgKind === "url" && (
-          <input
+          <input autoComplete="off"
             className="w-full border rounded px-2 py-1 text-sm"
             placeholder="https://example.com/wallpaper.jpg"
             value={prefs.bgKind === "url" ? prefs.bgSrc : ""}
@@ -324,7 +324,7 @@ export default function AppearanceTab() {
           <div className="space-y-2">
             <label className="ga-btn ga-btn-secondary cursor-pointer">
               {uploading ? "上传中…" : "选择图片 / 视频文件（≤100MB）"}
-              <input
+              <input autoComplete="off"
                 type="file"
                 accept="image/*,video/mp4,video/webm"
                 className="hidden"
@@ -367,7 +367,7 @@ export default function AppearanceTab() {
           <div>
             <div className="text-xs text-slate-500 mb-1.5">正文字体颜色（留空 = 默认）</div>
             <div className="flex items-center gap-2">
-              <input
+              <input autoComplete="off"
                 type="color"
                 value={/^#[0-9a-f]{6}$/i.test(prefs.textColor) ? prefs.textColor : "#0f172a"}
                 onChange={(e) => update({ textColor: e.target.value })}

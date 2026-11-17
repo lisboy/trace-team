@@ -1,9 +1,11 @@
 """lite Queue：基于 runs 表的 queued/claimed 状态，多 worker 并行领取。
 
-- 并行规则：优先领取「所属项目无活跃 run」的排队 run（跨项目/多会话并行）；
-  SAME_PROJECT_PARALLEL 开启时（默认），同项目也允许并行领取；关掉则同项目串行。
+- 并行规则：跨项目/多会话并行；同项目再按 ``projects.max_concurrency`` 限流
+  （0=不限）。达到上限时该项目的 run 留在队列里，等前面跑完再领。
+  ``SAME_PROJECT_PARALLEL`` 关掉时等价于所有项目上限 1（历史开关，保留兼容）。
 - 领取用「UPDATE ... WHERE status='queued'」原子防双领，多个 worker 竞争同一条时
   只有拿到 rowcount=1 的那个赢，其余顺延下一条——单机 SQLite 下也安全。
+- 多 worker 可能同时通过限流预检，所以领到后再数一次（含自己），越限就退回队列。
 - SQLite 并发写会偶发 ``database is locked``（默认 busy_timeout 之外的情况），
   claim 整体带几次退避重试，避免一次抖动就让某个 worker 空转、run 没人领。
 """
@@ -18,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from game_agent.config import SAME_PROJECT_PARALLEL
 from game_agent.core.abstractions import Queue
-from game_agent.db.models import Run
+from game_agent.db.models import Project, Run
 
 
 def _u(v):  # type: ignore[no-untyped-def]
@@ -62,9 +64,10 @@ class LiteQueue(Queue):
                 .limit(20)
             )
             rows = await s.execute(stmt)
+            limits = {pid: int(lim or 0) for pid, lim in (await s.execute(
+                select(Project.id, Project.max_concurrency))).all()}
             for run in rows.scalars().all():
-                # 平台不接管 git，同项目要不要串行只剩 SAME_PROJECT_PARALLEL 这一条规则。
-                # 但同一条会话内的 run 必须串行：用户同一个对话里连发几条，应该按顺序一条条做，
+                # 同一条会话内的 run 必须串行：用户同一个对话里连发几条，应该按顺序一条条做，
                 # 不能两条同时改同一个上下文（前端已排队，这里是后端兜底：两个标签页/刷新竞态）。
                 # 跨会话不受这条影响 —— 不同会话的 run 照旧可以同时执行。
                 busy = await s.scalar(
@@ -75,14 +78,16 @@ class LiteQueue(Queue):
                     ))
                 if busy:
                     continue
-                if not SAME_PROJECT_PARALLEL:
+                # 项目级并发上限：0=不限；SAME_PROJECT_PARALLEL=False 等价于上限 1。
+                limit = 1 if not SAME_PROJECT_PARALLEL else limits.get(run.project_id, 0)
+                if limit > 0:
                     busy = await s.scalar(
                         select(func.count()).select_from(Run).where(
                             Run.project_id == run.project_id,
                             Run.status.in_(("claimed", "running")),
                             Run.id != run.id,
                         ))
-                    if busy:
+                    if (busy or 0) >= limit:
                         continue
                 # 原子领取：带 status 条件防多 worker 双领（SQLite 无 SKIP LOCKED 时靠这条兜底）
                 res = await s.execute(
@@ -91,6 +96,21 @@ class LiteQueue(Queue):
                     .values(status="claimed", claimed_at=_now())
                 )
                 if res.rowcount:
+                    # 预检之后可能有别的 worker 同时领走本项目别的 run：领到后再数一次
+                    # （含自己），越限就退回队列，避免两个 worker 把上限冲爆。
+                    if limit > 0:
+                        active = await s.scalar(
+                            select(func.count()).select_from(Run).where(
+                                Run.project_id == run.project_id,
+                                Run.status.in_(("claimed", "running")),
+                            ))
+                        if (active or 0) > limit:
+                            await s.execute(
+                                update(Run)
+                                .where(Run.id == run.id, Run.status == "claimed")
+                                .values(status="queued", claimed_at=None))
+                            await s.commit()
+                            continue
                     await s.commit()
                     return str(run.id)
             # 没有可领的行：提交（释放 FOR UPDATE 读锁）后返回，交给调用方 sleep 再试

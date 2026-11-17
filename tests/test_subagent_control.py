@@ -12,9 +12,6 @@
 from __future__ import annotations
 
 import asyncio
-import uuid
-
-import pytest
 
 from game_agent.orchestration import interject, steering
 
@@ -127,16 +124,16 @@ def test_close_open_tasks_cancels_only_running(monkeypatch) -> None:
 # ---------------- 子agent 继承主agent 档位（修 403 SUBSCRIPTION_NOT_FOUND） ----------------
 
 def test_subagent_inherits_main_profile_when_unbound() -> None:
-    """sub 无自己的绑定 → 回落到主agent 的档位，绝不能让子agent 掉到 .env 全局端点。
+    """sub 无自己的绑定 → 回落到主agent 的档位；拿不到档位就由上层判未就绪。
 
-    这就是实测 2026-11-11「6 个子agent 全部 403、主agent 正常」的根因：sub 无绑定就会
-    _load_profile(None) → build_llm 用 .env 里过期的 gonode.si 订阅。
+    实测 2026-11-11「6 个子agent 全部 403、主agent 正常」的根因就是 sub 无绑定。
+    团队版没有 .env 全局兜底，所以这里必须继承，而不是返回 None 让适配器自己去猜端点。
     """
     from game_agent.orchestration import orchestrator as orch_mod
 
     o = orch_mod.Orchestrator.__new__(orch_mod.Orchestrator)
 
-    async def fake_agent_profile_key(team_id, role):
+    async def fake_agent_profile_key(team_id, role, project_id=None):
         return {"main": "profile-main", "sub": None}.get(role)
 
     o._agent_profile_key = fake_agent_profile_key  # type: ignore[assignment]
@@ -149,7 +146,7 @@ def test_subagent_inherits_main_profile_when_unbound() -> None:
     # sub 自己有绑定时用自己的
     assert asyncio.run(o._resolve_profile_key(
         "team", "sub", {}, own_key="profile-sub")) == "profile-sub"
-    # main 没有继承逻辑：无绑定就返回 None（走全局兜底）
+    # main 没有继承逻辑：无绑定就返回 None（由 execute_run 判「未绑定模型档位」）
     assert asyncio.run(o._resolve_profile_key("team", "main", {}, own_key=None)) is None
 
 

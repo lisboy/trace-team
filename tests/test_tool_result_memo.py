@@ -145,10 +145,13 @@ def test_memo_sig_is_exact_not_normalized() -> None:
 def test_sub_role_gets_no_thinking_by_default_but_main_keeps_default(monkeypatch) -> None:
     """sub 只读调研默认关思考（实测 -32% 延迟、-61% 输出 token）；主agent 不替用户降质量。"""
     from game_agent.config import LLM_SUB_MAX_OUTPUT_TOKENS
+    from game_agent.llm.base import Ctx
     from game_agent.llm.factory import build_llm
 
-    sub = build_llm("sub", None)
-    main = build_llm("main", None)
+    # 团队版没有 .env 全局兜底：构造适配器必须给一个可用的绑定档位
+    base = Ctx(model_profile={"model": "m", "base_url": "http://x/v1", "api_key": "k"})
+    sub = build_llm("sub", base)
+    main = build_llm("main", base)
     assert sub.reasoning_effort == "none", sub.reasoning_effort
     assert main.reasoning_effort == "", "主agent 不能默认关思考（质量取舍归用户）"
     # 输出上限默认不设：截断会把工具调用 JSON 切碎（实测 sub 的长输出全是思考 token，
@@ -157,8 +160,9 @@ def test_sub_role_gets_no_thinking_by_default_but_main_keeps_default(monkeypatch
     assert sub.max_tokens == 0 and main.max_tokens == 0
 
     # 档位显式配了就以档位为准（前端里给某个档位设 high 不被覆盖）
-    ctx = type("C", (), {"model_profile": {"params": {"reasoning_effort": "high",
-                                                      "max_tokens": 1234}}})()
+    ctx = type("C", (), {"model_profile": {
+        "model": "m", "base_url": "http://x/v1", "api_key": "k",
+        "params": {"reasoning_effort": "high", "max_tokens": 1234}}})()
     llm = build_llm("sub", ctx)
     assert llm.reasoning_effort == "high"
     assert llm.max_tokens == 1234

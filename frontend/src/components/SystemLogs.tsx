@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { api } from "../api";
+import SearchSelect from "./SearchSelect";
 
 type LogLine = {
   seq: number;
@@ -202,27 +203,25 @@ export default function SystemLogs({ open, onClose, embedded = false }: { open: 
             </span>
           )}
           <div className="ml-auto flex items-center gap-2 text-xs">
-            <select
-              className="border border-slate-200 rounded px-1.5 py-1 bg-white"
+            <SearchSelect
+              className="border border-slate-200 rounded px-1.5 py-1 bg-white min-w-[96px]"
               value={level}
-              onChange={(e) => setLevel(e.target.value)}
-            >
-              {LEVEL_OPTIONS.map((o) => (
-                <option key={o.value} value={o.value}>{o.label}</option>
-              ))}
-            </select>
-            <input
+              onChange={setLevel}
+              title="日志级别" searchPlaceholder="搜索级别…" panelMinWidth={140}
+              options={LEVEL_OPTIONS.map((o) => ({ value: o.value, label: o.label, keywords: o.value }))}
+            />
+            <input autoComplete="off"
               className="border border-slate-200 rounded px-2 py-1 w-40"
               placeholder="搜索日志…"
               value={q}
               onChange={(e) => setQ(e.target.value)}
             />
             <label className="flex items-center gap-1 text-slate-600 cursor-pointer select-none">
-              <input type="checkbox" checked={auto} onChange={(e) => setAuto(e.target.checked)} />
+              <input autoComplete="off" type="checkbox" checked={auto} onChange={(e) => setAuto(e.target.checked)} />
               自动刷新
             </label>
             <label className="flex items-center gap-1 text-slate-600 cursor-pointer select-none">
-              <input type="checkbox" checked={wrap} onChange={(e) => setWrap(e.target.checked)} />
+              <input autoComplete="off" type="checkbox" checked={wrap} onChange={(e) => setWrap(e.target.checked)} />
               换行
             </label>
             <button className="ga-btn ga-btn-ghost ga-btn-sm" onClick={jumpLatest} title="滚到最新一行">↓ 最新</button>

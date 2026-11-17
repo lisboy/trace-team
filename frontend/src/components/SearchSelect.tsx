@@ -35,6 +35,7 @@ export default function SearchSelect({
   disabled,
   title,
   className = "",
+  rootClassName = "",
   panelMinWidth = 160,
   searchPlaceholder = "输入关键字搜索…",
   emptyText = "没有匹配的选项",
@@ -48,6 +49,8 @@ export default function SearchSelect({
   disabled?: boolean;
   title?: string;
   className?: string;
+  /** 外层 span 的布局类（默认 inline-block；放进 flex/grid 撑满时传 w-full / flex-1） */
+  rootClassName?: string;
   panelMinWidth?: number;
   searchPlaceholder?: string;
   emptyText?: string;
@@ -181,7 +184,7 @@ export default function SearchSelect({
   }, [filtered]);
 
   return (
-    <span ref={rootRef} className="relative inline-block max-w-full align-middle">
+    <span ref={rootRef} className={`relative max-w-full align-middle ${rootClassName || "inline-block"}`}>
       <button
         ref={btnRef}
         type="button"
@@ -224,7 +227,7 @@ export default function SearchSelect({
           role="listbox"
         >
           <div className="border-b border-slate-100 p-1.5">
-            <input
+            <input autoComplete="off"
               ref={searchRef}
               value={q}
               onChange={(e) => { setQ(e.target.value); setActive(0); }}

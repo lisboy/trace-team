@@ -122,7 +122,7 @@ async def start_run_from_message(sf: async_sessionmaker, *, link, text: str,
         await s.refresh(msg)
         run = Run(team_id=link.team_id, project_id=sess.project_id, session_id=sess.id,
                   triggered_by=link.user_id, trigger_msg_id=msg.id, run_type="modify",
-                  options_json={"caps": {"test": True, "web": True, "media": True},
+                  options_json={"caps": {"test": True, "web": True},
                                 "source_channel": link.channel,
                                 "permission_scope": sess.permission_scope or "workspace"},
                   status="queued")

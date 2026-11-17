@@ -8,7 +8,7 @@
   执行: runs / tasks / work_orders
   产出: artifacts / approvals / comments
   遥测: events / audit_logs / usage_ledger / llm_calls
-  配置: model_profiles / asset_providers / agents / voice_profiles / settings
+  配置: model_profiles / asset_providers / agents / settings
 """
 from __future__ import annotations
 
@@ -28,7 +28,9 @@ from sqlalchemy import (
     UniqueConstraint,
     Uuid,
     BigInteger,
+    text,
 )
+from sqlalchemy.dialects.mysql import LONGTEXT as _MYSQL_LONGTEXT
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.types import TypeDecorator
 
@@ -38,7 +40,9 @@ def _utcnow() -> datetime:
 
 
 # 大文本列：SQLite 的 TEXT 没有长度上限，直接用它存完整 LLM 请求 / 事件细节。
-_LongText = Text()
+# MySQL 的 TEXT 只有 64KB（中文 3 字节/字，两万字就爆），所以按方言换成 LONGTEXT：
+# 团队版的 MySQL 部署实测 llm_transcripts 落库报 1406 Data too long（2026-11-17）。
+_LongText = Text().with_variant(_MYSQL_LONGTEXT(), "mysql")
 
 
 class UTCDateTime(TypeDecorator):
@@ -67,6 +71,8 @@ class Base(DeclarativeBase):
 class User(Base):
     __tablename__ = "users"
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=_uuid)
+    # 团队版登录名：管理员建号时指定，全局唯一（老数据没有用户名，保持 NULL 不冲突）
+    username: Mapped[str | None] = mapped_column(String(60), unique=True, nullable=True, index=True)
     email: Mapped[str] = mapped_column(String(320), unique=True, nullable=False, index=True)
     display_name: Mapped[str] = mapped_column(String(120), nullable=False)
     # 个人头像：/uploads/avatars/xxx.png 或外链；空 = 用首字母配色头像
@@ -75,6 +81,9 @@ class User(Base):
     oidc_sub: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     is_superuser: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # 初始密码 666666 / 管理员重置密码后为 True：登录后除改密/退出外的接口一律拒绝
+    must_change_password: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False, server_default=text("0"))
     failed_logins: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     locked_until: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
     # 个人外观偏好：主题/主色/背景图/字体颜色/字号（appearance 设置页写这里）
@@ -156,11 +165,25 @@ class Project(Base):
     git_remote: Mapped[str | None] = mapped_column(Text, nullable=True)
     base_branch: Mapped[str] = mapped_column(String(80), default="main", nullable=False)
     git_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # 仓库绑定：对话前先把远端最新内容同步到工作区。
+    # none 不同步；git 用 vcs_remote(或 git_remote) + 令牌；svn 用 vcs_remote + 账号密码。
+    vcs_type: Mapped[str] = mapped_column(String(8), default="none", nullable=False,
+                                         server_default="none")
+    vcs_remote: Mapped[str | None] = mapped_column(Text, nullable=True)
+    vcs_username: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    # Git 令牌 / SVN 密码。接口只回显是否已配置，绝不返回明文。
+    vcs_secret: Mapped[str | None] = mapped_column(Text, nullable=True)
     project_type: Mapped[str] = mapped_column(String(20), default="python", nullable=False)
     python_bin: Mapped[str | None] = mapped_column(Text, nullable=True)
     entry_point: Mapped[str | None] = mapped_column(Text, nullable=True)
     commands_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     budget_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    # 管理员为项目指定的模型档位（model_profiles.key）。所有对话强制用它，
+    # 用户/开发者不能改；为空时回退角色绑定（兼容老项目）。
+    model_profile_key: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    # 项目级并发上限：同时 claimed/running 的 run 最多几个，超出的排队。0 = 不限。
+    max_concurrency: Mapped[int] = mapped_column(Integer, default=0, nullable=False,
+                                                 server_default="0")
     branch_ttl_days: Mapped[int] = mapped_column(Integer, default=30, nullable=False)
     archived_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
     created_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
@@ -536,14 +559,18 @@ class LlmProvider(Base):
 
 
 class ModelProfile(Base):
+    """对话模型档位。project_id 为空 = 团队默认（所有项目可用）；
+    非空 = 该项目专属档位（解析时优先于团队默认）。"""
     __tablename__ = "model_profiles"
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=_uuid)
     team_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("teams.id", ondelete="CASCADE"), nullable=False, index=True)
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=True, index=True)
     key: Mapped[str] = mapped_column(String(40), nullable=False)
     label: Mapped[str] = mapped_column(String(120), nullable=False)
-    # 档位类型：llm=对话模型 | image=图像生成模型 | audio=音频生成模型
+    # 档位类型：仅 llm（历史库里可能残留 image/audio 行，不再读取）
     kind: Mapped[str] = mapped_column(String(10), default="llm", nullable=False)
-    provider: Mapped[str] = mapped_column(String(40), nullable=False)  # openai|anthropic|google|ollama|comfyui|openai_image|openai_tts
+    provider: Mapped[str] = mapped_column(String(40), nullable=False)  # openai|anthropic
     model: Mapped[str] = mapped_column(String(120), nullable=False)
     # 对话档位优先用 provider_id（供应商集中配）；base_url 仅作 inline 覆盖
     provider_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -553,7 +580,8 @@ class ModelProfile(Base):
     params_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_utcnow, nullable=False)
 
-    __table_args__ = (Index("ix_model_profiles_team_key", "team_id", "key"),)
+    __table_args__ = (Index("ix_model_profiles_team_project_key",
+                            "team_id", "project_id", "key"),)
 
 
 class AssetProvider(Base):
@@ -569,42 +597,23 @@ class AssetProvider(Base):
 
 
 class Agent(Base):
-    """团队级智能体配置（prompt / 绑模型 / 参数）。设计 §4.1：配置粒度为团队级。"""
+    """智能体配置（prompt / 绑模型 / 参数）。
+
+    project_id 为空 = 团队默认；非空 = 项目专属覆盖（解析时项目优先，未覆盖的字段
+    回退团队默认）。团队版按项目维度配置模型与智能体。
+    """
     __tablename__ = "agents"
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=_uuid)
     team_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("teams.id", ondelete="CASCADE"), nullable=False, index=True)
-    key: Mapped[str] = mapped_column(String(20), nullable=False)  # planner|artist|voice
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=True, index=True)
+    key: Mapped[str] = mapped_column(String(20), nullable=False)  # main|sub
     system_prompt: Mapped[str] = mapped_column(Text, nullable=False)
     model_profile_key: Mapped[str | None] = mapped_column(String(40), nullable=True)
     params_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_utcnow, nullable=False)
 
-    __table_args__ = (Index("ix_agents_team_key", "team_id", "key"),)
-
-
-class VoiceProfile(Base):
-    __tablename__ = "voice_profiles"
-    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=_uuid)
-    team_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("teams.id", ondelete="CASCADE"), nullable=False, index=True)
-    slug: Mapped[str] = mapped_column(String(80), nullable=False)
-    label: Mapped[str] = mapped_column(String(120), nullable=False)
-    params_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_utcnow, nullable=False)
-
-
-class ImagePreset(Base):
-    """生图工作台参数预设：工作流方式 / 尺寸 / LoRA / 强度 / 提示词增强等一套出图配方。"""
-    __tablename__ = "image_presets"
-    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=_uuid)
-    team_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("teams.id", ondelete="CASCADE"), nullable=False, index=True)
-    key: Mapped[str] = mapped_column(String(60), nullable=False)
-    label: Mapped[str] = mapped_column(String(120), nullable=False)
-    params_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
-    # 预设参考图（DATA_DIR/objects/imagegen/presets 下的文件名），None=没有样图
-    image_file: Mapped[str | None] = mapped_column(String(200), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_utcnow, nullable=False)
-
-    __table_args__ = (Index("ix_image_presets_team_key", "team_id", "key"),)
+    __table_args__ = (Index("ix_agents_team_project_key", "team_id", "project_id", "key"),)
 
 
 class Settings(Base):
@@ -627,6 +636,9 @@ class ChannelLink(Base):
     __tablename__ = "channel_links"
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=_uuid)
     team_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("teams.id", ondelete="CASCADE"), nullable=False, index=True)
+    # 项目级通道：绑定属于某个项目时只推送该项目的事件；为空是团队级/历史绑定。
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=True, index=True)
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     # wecom|dingtalk|wechat|webhook：企业微信（可主动推消息）/钉钉（可主动推+可入站）/个微（仅入站）/通用 webhook
     channel: Mapped[str] = mapped_column(String(16), nullable=False)

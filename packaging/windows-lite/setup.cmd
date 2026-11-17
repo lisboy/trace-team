@@ -68,14 +68,13 @@ if exist ".env" (
 
 echo.
 echo ================= DONE =================
-echo   1^) open  .env  with Notepad and set:
-echo        GA_LLM_MODE=real
-echo        OPENAI_API_KEY=your-key
-echo        OPENAI_BASE_URL=https://your-endpoint/v1
-echo        GA_LLM_MODEL=model-name
-echo   2^) double-click  start.cmd  to run
-echo   3^) open http://127.0.0.1:18888/setup to create the first owner
-echo      (default port 18888; if busy it auto-shifts, real port prints at startup)
+echo   1^) double-click  start.cmd  to run
+echo   2^) first login:  admin / 666666  (you MUST change it on first login)
+echo      Other accounts, projects and the project model are managed by the
+echo      admin in the "Team" page.
+echo   3^) this Windows package keeps data in %%USERPROFILE%%\.trace-team
+echo      (SQLite, single machine). For the shared team deployment use the
+echo      Linux package, which bundles MariaDB + Python runtime.
 echo   Stop service: double-click stop.cmd
 echo =======================================
 echo.

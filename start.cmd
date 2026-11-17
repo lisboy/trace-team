@@ -5,7 +5,7 @@ REM 用法：
 REM   双击 start.cmd        -> 菜单（启动服务 / 停止服务 / 退出）
 REM   start.cmd run         -> 直接启动服务（等同菜单 [1]）
 REM   start.cmd stop        -> 停止服务
-REM 说明：本版本没有登录/账号密码，不需要注册或重置密码，启动后浏览器直接可用。
+REM 说明：首次启动内置管理员 admin / 666666，首次登录必须改密；其他账号由管理员在「团队」页创建。
 setlocal EnableExtensions DisableDelayedExpansion
 pushd "%~dp0"
 set "ROOT=%~dp0"
@@ -27,7 +27,7 @@ echo ============================================================
 echo   循迹 Trace
 echo ------------------------------------------------------------
 echo   [1] 启动服务（就绪后自动打开浏览器）
-echo   [2] 停止服务（顺带停掉本地 ComfyUI / 语音，释放显存）
+echo   [2] 停止服务（顺带停掉本地出图服务，释放显存）
 echo   [0] 退出
 echo ============================================================
 echo.
@@ -39,14 +39,14 @@ if "%CHOICE%"=="0" goto end
 goto menu
 
 :run
-REM DB: SQLite only (%GA_DATA_DIR%\game_agent.db or ~/.trace). No DB server needed.
+REM DB: DATABASE_URL 留空 = SQLite（本机开发/试用）；团队正式部署用 MySQL（Linux 包内置 MariaDB）。
 echo.
 echo [trace] 正在启动服务，就绪后会自动打开浏览器...
+echo         首次登录：admin / 666666（会强制修改密码）。
 echo         端口默认 18888，被占用或落在系统保留段会自动顺延，日志里会打印实际端口。
 echo         关闭本窗口 = 停止服务。
 echo.
 set GA_MODE=lite
-set GA_SEED_DEMO=1
 set GA_OPEN_BROWSER=1
 python -m game_agent.main
 echo.

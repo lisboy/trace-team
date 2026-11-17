@@ -15,7 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import select
 
-from game_agent.api.deps import RequestContext, require
+from game_agent.api.deps import RequestContext, owns_session, require
 from game_agent.api.state import state
 from game_agent.auth.rbac import PERM_RUN_CREATE, PERM_VIEW
 from game_agent.db.models import Message, Run, RunQuestion, Session
@@ -63,7 +63,8 @@ async def list_questions(session_id: str, ctx: RequestContext = Depends(require(
     """会话问题列表：前端用它渲染「待回答」面板与「已回答」记录（刷新/重连后仍在）。"""
     async with state.session_factory() as s:
         sess = await s.get(Session, _u(session_id))
-        if sess is None or not _same_team(sess.team_id, ctx.team_id):
+        if (sess is None or not _same_team(sess.team_id, ctx.team_id)
+                or not owns_session(ctx, sess.created_by)):
             raise HTTPException(status_code=404, detail="会话不存在")
         rows = (await s.execute(
             select(RunQuestion).where(RunQuestion.session_id == sess.id)
@@ -90,7 +91,7 @@ async def answer_question(question_id: str, body: AnswerIn,
         if q.status != "pending":
             raise HTTPException(status_code=409, detail="该问题已回答")
         sess = await s.get(Session, q.session_id)
-        if sess is None:
+        if sess is None or not owns_session(ctx, sess.created_by):
             raise HTTPException(status_code=404, detail="会话不存在")
         # 续跑类型跟着提问那条 run 走：analyze 会被编排器剔掉写码/起服务/派发的工具，
         # 组长带着答案却出不了图、改不了代码（见 orchestrator.run_agent 的 WRITE_TOOLS 过滤）

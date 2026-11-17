@@ -1,16 +1,16 @@
-"""消息通道 HTTP 接口（设置页 + 通道回调用）。
+"""消息通道 HTTP 接口（项目配置 + 通道回调用）。
 
 路由分组：
-  GET  /api/channels                     通道清单 + 当前绑定状态 + 能力档位
+  GET  /api/channels?project_id=…        通道清单 + 该项目绑定状态 + 能力档位
   POST /api/channels/{channel}/bind      直接填凭证完成绑定（webhook / 应用凭证），**不再需要扫码**
   POST /api/channels/{id}/unlink         解绑
-  PATCH /api/channels/{id}               通知开关 / 默认项目 / 是否允许 IM 回复
+  PATCH /api/channels/{id}               通知开关 / 是否允许 IM 回复
   POST /api/channels/{id}/test           发一条测试消息（让用户当场确认通道通了）
-  GET  /api/channels/messages            最近的推送记录（排障用）
+  GET  /api/channels/messages            最近的推送记录（排障用，可按项目过滤）
   POST /api/channels/{channel}/callback  通道入站回调（钉钉/企微/个微，可选能力）
 
-绑定方式已从「扫码」改为「直接填地址/凭证」：扫码要求手机能访问本机地址（需公网），
-而「任务完成提醒」本身是纯出站推送，零公网就能用。故 /code 路由与二维码能力一并移除。
+团队版：通道按项目配置，入口在项目配置弹窗里（管理员）。run 收尾只推该项目自己的
+绑定；项目还没配时退回团队级历史绑定，升级后提醒不会突然全断。
 
 配置（全局应用凭证）读 settings 表的 ``channels_cfg`` 键，界面在同一个面板里填。
 """
@@ -25,10 +25,9 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import select
 
-from game_agent.api.deps import RequestContext, _u, require
+from game_agent.api.deps import RequestContext, _u, require_admin
 from game_agent.api.state import state
-from game_agent.auth.rbac import PERM_VIEW
-from game_agent.db.models import ChannelLink, ChannelMessage, Settings
+from game_agent.db.models import ChannelLink, ChannelMessage, Project, Settings
 from game_agent.db.session import SessionLocal
 from game_agent.integrations import channels as ch
 from game_agent.integrations import inbound
@@ -78,6 +77,7 @@ def _link_dict(l: ChannelLink) -> dict:
         "status": l.status, "can_push": meta["can_push"], "can_inbound": meta["can_inbound"],
         "notify_done": l.notify_done, "notify_question": l.notify_question,
         "notify_failed": l.notify_failed, "inbound_enabled": l.inbound_enabled,
+        "project_id": str(l.project_id) if l.project_id else None,
         "default_project_id": str(l.default_project_id) if l.default_project_id else None,
         "last_session_id": str(l.last_session_id) if l.last_session_id else None,
         "credentials_ready": {k: bool(v) for k, v in cred.items() if k != "session_webhook_expire"},
@@ -87,13 +87,20 @@ def _link_dict(l: ChannelLink) -> dict:
 
 
 @router.get("")
-async def list_channels(ctx: RequestContext = Depends(require(PERM_VIEW))):
-    """通道清单 + 本团队绑定情况 + 全局凭证是否就绪。"""
+async def list_channels(project_id: str | None = None,
+                        ctx: RequestContext = Depends(require_admin())):
+    """通道清单 + 绑定情况 + 全局凭证是否就绪。带 project_id 时只看该项目的绑定。"""
     cfg = await _app_cfg()
     async with _sf()() as s:
-        rows = (await s.execute(select(ChannelLink).where(
+        q = select(ChannelLink).where(
             ChannelLink.team_id == _u(ctx.team_id),
-            ChannelLink.status == "active").order_by(ChannelLink.created_at.asc()))).scalars().all()
+            ChannelLink.status == "active")
+        if project_id:
+            proj = await s.get(Project, _u(project_id))
+            if proj is None or str(proj.team_id) != str(_u(ctx.team_id)):
+                raise HTTPException(status_code=404, detail="项目不存在")
+            q = q.where(ChannelLink.project_id == proj.id)
+        rows = (await s.execute(q.order_by(ChannelLink.created_at.asc()))).scalars().all()
     return {
         "channels": ch.all_channels(),
         "links": [_link_dict(r) for r in rows],
@@ -121,7 +128,7 @@ class AppCfgIn(BaseModel):
 
 
 @router.post("/app-config")
-async def save_app_config(body: AppCfgIn, ctx: RequestContext = Depends(require(PERM_VIEW))):
+async def save_app_config(body: AppCfgIn, ctx: RequestContext = Depends(require_admin())):
     cfg = await _app_cfg()
     dt = dict(cfg.get("dingtalk") or {})
     wc = dict(cfg.get("wecom") or {})
@@ -158,38 +165,54 @@ class BindIn(BaseModel):
     gateway_url: str | None = None      # 微信个人号：自备第三方网关地址
     external_id: str | None = None
     display_name: str | None = None
+    project_id: str | None = None       # 项目级绑定：只推该项目的任务提醒
     default_project_id: str | None = None
 
 
-async def _group_ext(sf, team_id, user_id, channel: str) -> str:
+async def _project_or_404(s, team_id, project_id) -> Project:
+    proj = await s.get(Project, _u(project_id)) if project_id else None
+    if proj is None or str(proj.team_id) != str(_u(team_id)):
+        raise HTTPException(status_code=404, detail="项目不存在")
+    return proj
+
+
+async def _group_ext(sf, team_id, user_id, channel: str, project_id=None) -> str:
     """群机器人绑定用的占位标识。
 
-    复用当前用户在该通道上已有的 group- 标识，避免「手滑点两次保存」变成两条
+    复用同一项目/同一用户在该通道上已有的 group- 标识，避免「手滑点两次保存」变成两条
     绑定、同一个群收到两遍提醒；没有才新建。
     """
     async with sf() as s:
-        row = await s.scalar(select(ChannelLink).where(
+        q = select(ChannelLink).where(
             ChannelLink.team_id == team_id,
             ChannelLink.user_id == user_id,
             ChannelLink.channel == channel,
             ChannelLink.status == "active",
-            ChannelLink.external_id.like("group-%")).limit(1))
+            ChannelLink.external_id.like("group-%"))
+        q = (q.where(ChannelLink.project_id == _u(project_id)) if project_id
+             else q.where(ChannelLink.project_id.is_(None)))
+        row = await s.scalar(q.limit(1))
         if row is not None:
             return row.external_id
     return f"group-{uuid.uuid4().hex[:8]}"
 
 
 @router.post("/{channel}/bind")
-async def bind(channel: str, body: BindIn, ctx: RequestContext = Depends(require(PERM_VIEW))):
+async def bind(channel: str, body: BindIn, ctx: RequestContext = Depends(require_admin())):
     """直接填地址/凭证完成绑定（不需要扫码、不需要公网）。
 
     - 只填 webhook → 绑成「群提醒」，external_id 用 group-<随机> 占位，任务完成就往群里推；
     - 另填 external_id → 按该通道侧身份绑定，可走工作通知/应用消息定向发给这个人；
-    - 微信个人号只能填 gateway_url（官方无接口）。
+    - 微信个人号只能填 gateway_url（官方无接口）；
+    - project_id 给了就是项目级绑定，只推该项目的任务提醒。
     """
     if channel not in ch.CHANNELS:
         raise HTTPException(status_code=404, detail="未知通道")
     sf = _sf()
+    proj_id = None
+    if body.project_id:
+        async with sf() as s:
+            proj_id = (await _project_or_404(s, ctx.team_id, body.project_id)).id
     cred: dict = {}
     if body.webhook:
         cred["webhook"] = body.webhook.strip()
@@ -199,6 +222,8 @@ async def bind(channel: str, body: BindIn, ctx: RequestContext = Depends(require
         cred["gateway_url"] = body.gateway_url.strip()
     ext = (body.external_id or "").strip()
     meta = ch.channel_meta(channel)
+    # 项目级绑定默认把用户提问路由到该项目（IM 里回复继续对话时用）
+    default_pid = (_u(body.default_project_id) if body.default_project_id else proj_id)
 
     # 微信个人号：没有官方接口，只能填第三方网关
     if channel == "wechat":
@@ -207,12 +232,14 @@ async def bind(channel: str, body: BindIn, ctx: RequestContext = Depends(require
                 status_code=400,
                 detail="个人微信没有官方推送接口：平台无法直接提醒到个人微信。"
                        "如已自建网关（如 wechaty 服务化），请填它的地址。")
-        link = await ch.upsert_link(
-            sf, team_id=_u(ctx.team_id), user_id=_u(ctx.user_id), channel="wechat",
-            external_id=ext or f"wx-{str(ctx.user_id)[:8]}",
-            display_name=body.display_name or "微信（第三方网关）",
-            credentials=cred,
-            default_project_id=_u(body.default_project_id) if body.default_project_id else None)
+        try:
+            link = await ch.upsert_link(
+                sf, team_id=_u(ctx.team_id), user_id=_u(ctx.user_id), channel="wechat",
+                external_id=ext or f"wx-{str(ctx.user_id)[:8]}",
+                display_name=body.display_name or "微信（第三方网关）",
+                credentials=cred, default_project_id=default_pid, project_id=proj_id)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         return {"ok": True, "link": _link_dict(link)}
 
     # 其余通道至少要有一种推送手段：webhook 地址，或已配置的全局应用凭证
@@ -227,20 +254,22 @@ async def bind(channel: str, body: BindIn, ctx: RequestContext = Depends(require
 
     # 群机器人绑定：没有具体接收人身份，用占位标识避免和「定向绑定」互相顶掉
     if not ext:
-        ext = await _group_ext(sf, _u(ctx.team_id), _u(ctx.user_id), channel)
-    link = await ch.upsert_link(
-        sf, team_id=_u(ctx.team_id), user_id=_u(ctx.user_id), channel=channel,
-        external_id=ext,
-        display_name=body.display_name or ("群提醒" if ext.startswith("group-") else ext),
-        credentials=cred or None,
-        default_project_id=_u(body.default_project_id) if body.default_project_id else None,
-        inbound_enabled=False)
+        ext = await _group_ext(sf, _u(ctx.team_id), _u(ctx.user_id), channel, proj_id)
+    try:
+        link = await ch.upsert_link(
+            sf, team_id=_u(ctx.team_id), user_id=_u(ctx.user_id), channel=channel,
+            external_id=ext,
+            display_name=body.display_name or ("群提醒" if ext.startswith("group-") else ext),
+            credentials=cred or None, default_project_id=default_pid,
+            inbound_enabled=False, project_id=proj_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     return {"ok": True, "link": _link_dict(link),
             "message": f"已关联{meta['label']}，任务完成会推送到这里"}
 
 
 @router.post("/{link_id}/unlink")
-async def unlink(link_id: str, ctx: RequestContext = Depends(require(PERM_VIEW))):
+async def unlink(link_id: str, ctx: RequestContext = Depends(require_admin())):
     ok = await ch.unlink(_sf(), _u(ctx.team_id), _u(link_id))
     if not ok:
         raise HTTPException(status_code=404, detail="绑定不存在")
@@ -252,11 +281,10 @@ class LinkPatch(BaseModel):
     notify_question: bool | None = None
     notify_failed: bool | None = None
     inbound_enabled: bool | None = None
-    default_project_id: str | None = None
 
 
 @router.patch("/{link_id}")
-async def patch_link(link_id: str, body: LinkPatch, ctx: RequestContext = Depends(require(PERM_VIEW))):
+async def patch_link(link_id: str, body: LinkPatch, ctx: RequestContext = Depends(require_admin())):
     async with _sf()() as s:
         link = await s.get(ChannelLink, _u(link_id))
         if link is None or str(link.team_id) != str(_u(ctx.team_id)):
@@ -265,15 +293,13 @@ async def patch_link(link_id: str, body: LinkPatch, ctx: RequestContext = Depend
             v = getattr(body, f)
             if v is not None:
                 setattr(link, f, v)
-        if body.default_project_id is not None:
-            link.default_project_id = _u(body.default_project_id) if body.default_project_id else None
         await s.commit()
         await s.refresh(link)
         return {"ok": True, "link": _link_dict(link)}
 
 
 @router.post("/{link_id}/test")
-async def send_test(link_id: str, ctx: RequestContext = Depends(require(PERM_VIEW))):
+async def send_test(link_id: str, ctx: RequestContext = Depends(require_admin())):
     """发一条测试消息：让用户当场验证通道是否真的通（而不是等下一次任务跑完）。"""
     sf = _sf()
     async with sf() as s:
@@ -289,11 +315,17 @@ async def send_test(link_id: str, ctx: RequestContext = Depends(require(PERM_VIE
 
 
 @router.get("/messages")
-async def list_messages(limit: int = 30, ctx: RequestContext = Depends(require(PERM_VIEW))):
+async def list_messages(limit: int = 30, project_id: str | None = None,
+                        ctx: RequestContext = Depends(require_admin())):
     async with _sf()() as s:
-        rows = (await s.execute(select(ChannelMessage).where(
-            ChannelMessage.team_id == _u(ctx.team_id))
-            .order_by(ChannelMessage.created_at.desc()).limit(max(1, min(limit, 100))))).scalars().all()
+        q = select(ChannelMessage).where(ChannelMessage.team_id == _u(ctx.team_id))
+        if project_id:
+            proj = await _project_or_404(s, ctx.team_id, project_id)
+            q = q.where(ChannelMessage.link_id.in_(
+                select(ChannelLink.id).where(ChannelLink.project_id == proj.id)))
+        rows = (await s.execute(
+            q.order_by(ChannelMessage.created_at.desc())
+            .limit(max(1, min(limit, 100))))).scalars().all()
     return {"items": [{
         "id": str(r.id), "channel": r.channel, "kind": r.kind, "title": r.title,
         # 正文回**全文**：设置页「查看推送内容」看到的必须和钉钉实际收到的完全一致，
@@ -344,7 +376,7 @@ async def callback(channel: str, request: Request):
 
 
 @router.get("/{channel}/callback-info")
-async def callback_info(channel: str, request: Request, ctx: RequestContext = Depends(require(PERM_VIEW))):
+async def callback_info(channel: str, request: Request, ctx: RequestContext = Depends(require_admin())):
     """给界面显示「回调地址填什么」（钉钉机器人 / 企微应用的接收地址）。"""
     cfg = await _app_cfg()
     base = (cfg.get("public_base_url") or "").rstrip("/")

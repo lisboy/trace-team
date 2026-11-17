@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { api } from "../api";
+import SearchSelect from "./SearchSelect";
 
 /** 模型配置：供应商（地址 + 密钥 + UA）只在这里存一次，
  *  每个供应商维护自己的模型目录（模型名 + 上下文窗口）。
@@ -43,6 +44,10 @@ export type ModelProfileRow = {
   key_hint: string | null;
   params_json: { context_window?: number; vision?: boolean; voice?: string; reasoning_effort?: string; [k: string]: any };
   bound_roles: string[];
+  /** 空/缺省 = 团队默认档位；非空 = 该项目专属档位 */
+  project_id?: string | null;
+  /** 带 project_id 查询时：该行是团队默认（项目未覆盖） */
+  inherited?: boolean;
 };
 
 const ROLE_NAMES: Record<string, string> = { main: "助手" };
@@ -131,7 +136,7 @@ function WindowInput({ value, onCommit }: { value: number; onCommit: (n: number)
   const bad = Number.isNaN(parsed);
   return (
     <div className="flex items-center gap-1.5 shrink-0">
-      <input
+      <input autoComplete="off"
         className={`border rounded px-2 py-1 text-xs w-28 ${bad ? "border-red-400 bg-red-50" : ""}`}
         placeholder="如 256k / 1M"
         value={draft}
@@ -163,15 +168,7 @@ type Props = {
   refresh: () => void;
 };
 
-const emptyPf = {
-  key: "", label: "", kind: "image", provider: "comfyui", model: "", base_url: "",
-  context_window: "", vision: false, api_key: "", voice: "", provider_id: "",
-  reasoning_effort: "",
-};
-
 export default function ModelConfigTab({ profiles, providers, refresh }: Props) {
-  const [pf, setPf] = useState({ ...emptyPf });
-  const [pfOpen, setPfOpen] = useState(false);
   const [err, setErr] = useState("");
   const [showKey, setShowKey] = useState(false);
   // 正在编辑的供应商 id（"" = 新建），null = 表单收起
@@ -203,36 +200,6 @@ export default function ModelConfigTab({ profiles, providers, refresh }: Props) 
     const t = window.setTimeout(() => provFormRef.current?.scrollIntoView({ block: "nearest", behavior: "smooth" }), 30);
     return () => window.clearTimeout(t);
   }, [provForm]);
-
-  const mediaProfiles = profiles.filter((p) => p.kind === "image" || p.kind === "audio");
-
-  async function createProfile() {
-    setErr("");
-    if (!pf.key.trim()) { setErr("标识必填"); return; }
-    if (!pf.model.trim()) { setErr("请填写模型名"); return; }
-    if (!pf.base_url.trim()) { setErr("媒体档位必须填 Base URL"); return; }
-    const params: Record<string, any> = {};
-    if (pf.kind === "audio" && pf.voice.trim()) params.voice = pf.voice.trim();
-    if (pf.api_key) params.api_key = pf.api_key;
-    const kindProvider = pf.kind === "image"
-      ? (pf.provider === "openai" ? "openai_image" : pf.provider)
-      : "openai_tts";
-    try {
-      await api.createModelProfile({
-        key: pf.key.trim(), label: pf.label.trim() || pf.key.trim(), kind: pf.kind,
-        provider: kindProvider,
-        model: pf.model.trim(),
-        provider_id: null,
-        base_url: pf.base_url || null,
-        params_json: params,
-      });
-      setPf({ ...emptyPf });
-      setPfOpen(false);
-      refresh();
-    } catch (e: any) {
-      setErr(e?.message || "创建失败");
-    }
-  }
 
   function provOf(id: string) {
     return providers.find((x) => x.id === id);
@@ -457,7 +424,7 @@ export default function ModelConfigTab({ profiles, providers, refresh }: Props) 
         <div className={`rounded-lg border p-3 ${health.ready ? "border-emerald-200 bg-emerald-50/50" : "border-rose-300 bg-rose-50/70"}`}>
           <div className="flex items-center gap-2 text-sm">
             <span className={`text-[10px] px-1.5 py-0.5 rounded ${health.ready ? "bg-emerald-100 text-emerald-700" : "bg-rose-100 text-rose-700"}`}>
-              {health.ready ? "已接通真实大模型" : "还没有可用的模型供应商"}
+              {health.ready ? "已接通真实大模型" : "还没有绑定可用的模型"}
             </span>
             <span className="text-slate-700">
               {health.model ? <>当前模型 <span className="mono">{health.model}</span></> : "未配置模型"}
@@ -477,18 +444,19 @@ export default function ModelConfigTab({ profiles, providers, refresh }: Props) 
           )}
           {healthOpen && (
             <div className="mt-2 rounded bg-white/70 border border-slate-200 p-2 text-[11px] text-slate-600 space-y-1">
-              <div>角色绑定档位：{health.profile_ok ? <span className="text-emerald-700">已就绪</span> : <span className="text-amber-700">{health.profile_issue || "未绑定"}</span>}</div>
+              <div>绑定档位：{health.profile_ok ? <span className="text-emerald-700">已就绪</span> : <span className="text-amber-700">{health.profile_issue || "未绑定"}</span>}</div>
               <div>本轮模型：<span className="mono">{health.model || "未配置"}</span>{health.provider ? ` · ${health.provider}` : ""}</div>
-              <div>全局兜底（.env）：<span className="mono">{health.fallback_model}</span> · {health.fallback_has_key ? <span className="text-emerald-700">已配 OPENAI_API_KEY</span> : <span className="text-rose-700">未配 OPENAI_API_KEY</span>}</div>
+              <div>模型来源：管理员绑定的档位（团队默认 / 项目绑定）；不使用 .env 全局兜底模型。</div>
             </div>
           )}
         </div>
       )}
+      {err && <div className="text-xs text-red-600">{err}</div>}
       {/* ---------- 1. LLM 供应商 + 模型目录 ---------- */}
       <div className="bg-white rounded-lg border border-slate-200 p-4">
         <div className="flex items-center gap-2 mb-1">
           <span className="font-medium text-sm">LLM 供应商</span>
-          <span className="text-[11px] text-slate-400">地址与密钥只在这里存一次；每个供应商维护自己的模型目录和上下文窗口。对话实际用哪个模型，在聊天输入框右下角选</span>
+          <span className="text-[11px] text-slate-400">地址与密钥团队内共用，只在这里存一次；每个供应商维护自己的模型目录和上下文窗口。实际用哪个模型在「智能体」页绑定：作用范围选团队默认，或选某个项目固定该项目用的模型</span>
           <button
             className="ml-auto ga-btn ga-btn-secondary ga-btn-sm"
             onClick={() => openProvForm()}
@@ -500,27 +468,28 @@ export default function ModelConfigTab({ profiles, providers, refresh }: Props) 
 
         {provForm !== null && (
           <div ref={provFormRef} className="mb-3 rounded border border-brand-200 bg-brand-50/40 p-3 grid grid-cols-2 gap-2 text-sm">
-            <input
+            <input autoComplete="off"
               className="border rounded px-2 py-1 mono text-xs"
               placeholder={provForm === "new" ? "标识（如 gonode，由地址自动填）" : "标识（不可改）"}
               value={pv.key}
               disabled={provForm !== "new"}
               onChange={(e) => setPv({ ...pv, key: e.target.value })}
             />
-            <input
+            <input autoComplete="off"
               className="border rounded px-2 py-1"
               placeholder="显示名（如 中转站 / DeepSeek 官方）"
               value={pv.label}
               onChange={(e) => setPv({ ...pv, label: e.target.value })}
             />
-            <select className="border rounded px-2 py-1" value={pv.protocol}
-              onChange={(e) => setPv({ ...pv, protocol: e.target.value })}>
-              {PROTOCOLS.map((o) => <option key={o.v} value={o.v}>{o.t}</option>)}
-            </select>
+            <SearchSelect className="border rounded px-2 py-1 bg-white w-full" rootClassName="w-full"
+              value={pv.protocol}
+              onChange={(v) => setPv({ ...pv, protocol: v })}
+              title="对话协议" searchPlaceholder="搜索协议…" panelMinWidth={280}
+              options={PROTOCOLS.map((o) => ({ value: o.v, label: o.t, keywords: o.v }))} />
             <div className="col-span-2 -mt-1 text-[11px] text-slate-500">
               对话协议按供应商实际接口选：OpenAI 兼容（/v1/chat/completions）或 Anthropic 原生（/v1/messages）。google/ollama 暂未适配。
             </div>
-            <input
+            <input autoComplete="off"
               className="border rounded px-2 py-1 mono text-xs col-span-2"
               placeholder="Base URL（填根域名或 /v1 都行，如 https://api.deepseek.com 或 https://xxx/v1）"
               value={pv.base_url}
@@ -559,7 +528,7 @@ export default function ModelConfigTab({ profiles, providers, refresh }: Props) 
               )}
             </div>
             <div className="col-span-2 flex items-center gap-2">
-              <input
+              <input autoComplete="off"
                 className="border rounded px-2 py-1 flex-1 mono text-xs"
                 placeholder="User-Agent（可选：站点挂了 Cloudflare 并拦脚本时，点右侧填浏览器 UA）"
                 value={pv.user_agent}
@@ -571,7 +540,7 @@ export default function ModelConfigTab({ profiles, providers, refresh }: Props) 
                 填浏览器 UA
               </button>
               <label className="flex items-center gap-1 text-xs text-slate-600 shrink-0">
-                <input type="checkbox" checked={pv.enabled}
+                <input autoComplete="off" type="checkbox" checked={pv.enabled}
                   onChange={(e) => setPv({ ...pv, enabled: e.target.checked })} />
                 启用
               </label>
@@ -616,7 +585,7 @@ export default function ModelConfigTab({ profiles, providers, refresh }: Props) 
               )}
               {pv.models.map((m, i) => (
                 <div key={i} className="flex items-center gap-1.5 mb-1">
-                  <input
+                  <input autoComplete="off"
                     className="border rounded px-2 py-1 mono text-xs flex-1 min-w-0"
                     placeholder="模型名（如 deepseek-v4-pro）"
                     value={m.name}
@@ -630,7 +599,7 @@ export default function ModelConfigTab({ profiles, providers, refresh }: Props) 
                     className="flex items-center gap-1 text-[11px] text-slate-600 shrink-0 cursor-pointer select-none"
                     title="勾选=支持看图。不勾时，发给模型的附图会被忽略（模型看不到画面，只能读到「图片已附在本条消息中」）。带视觉能力的模型（如 deepseek-v4.1-flash / kimi-k3-1）请勾上。"
                   >
-                    <input
+                    <input autoComplete="off"
                       type="checkbox"
                       checked={!!m.vision}
                       onChange={(e) => patchPvModel(i, { vision: e.target.checked })}
@@ -744,109 +713,8 @@ export default function ModelConfigTab({ profiles, providers, refresh }: Props) 
           ))}
           {providers.length === 0 && (
             <div className="text-xs text-slate-400">
-              还没有供应商。加一个供应商并在它的模型目录里添加模型（可逐个设置上下文窗口）后，聊天输入框右下角就能直接选模型对话，不用再在设置页配置对话档位。
+              还没有供应商。先加一个供应商并在它的模型目录里添加模型（可逐个设置上下文窗口），然后在「智能体」页绑定对话模型（作用范围选团队默认或某个项目）。
             </div>
-          )}
-        </div>
-      </div>
-
-      {/* ---------- 2. 图像 / 音频档位 ---------- */}
-      <div className="bg-white rounded-lg border border-slate-200 p-4">
-        <div className="flex items-center gap-2 mb-1">
-          <span className="font-medium text-sm">图像 / 音频档位</span>
-          <span className="text-[11px] text-slate-400">出图 / 配音走各自的驱动，仍在这里内联地址和密钥</span>
-          <button
-            className="ml-auto ga-btn ga-btn-primary ga-btn-sm"
-            onClick={() => { setErr(""); setPfOpen((v) => !v); }}
-          >
-            {pfOpen ? "收起表单" : "＋ 新建档位"}
-          </button>
-        </div>
-        <div className={pfOpen ? "grid grid-cols-2 gap-2 text-sm mt-3" : "hidden"}>
-          <input className="border rounded px-2 py-1" placeholder="标识（如 comfy-local / tts-main）" value={pf.key}
-            onChange={(e) => setPf({ ...pf, key: e.target.value })} />
-          <input className="border rounded px-2 py-1" placeholder="显示名（如 本地 ComfyUI）" value={pf.label}
-            onChange={(e) => setPf({ ...pf, label: e.target.value })} />
-          <select className="border rounded px-2 py-1" value={pf.kind}
-            onChange={(e) => setPf({ ...pf, kind: e.target.value, provider: e.target.value === "image" ? "comfyui" : "openai_tts" })}>
-            <option value="image">图像生成模型</option>
-            <option value="audio">音频生成模型</option>
-          </select>
-          <input className="border rounded px-2 py-1" placeholder="模型名（如 gemini-2.5-flash-image / tts-1）"
-            value={pf.model} onChange={(e) => setPf({ ...pf, model: e.target.value })} />
-          <select className="border rounded px-2 py-1" value={pf.provider}
-            onChange={(e) => setPf({ ...pf, provider: e.target.value })}>
-            {pf.kind === "image" ? (
-              <>
-                <option value="comfyui">ComfyUI（本地工作流）</option>
-                <option value="openai_image">OpenAI 兼容（/images/generations）</option>
-              </>
-            ) : (
-              <option value="openai_tts">OpenAI 兼容语音（/audio/speech）</option>
-            )}
-          </select>
-          {pf.kind === "audio" && (
-            <input className="border rounded px-2 py-1" placeholder="音色（voice，可选，如 alloy）" value={pf.voice}
-              onChange={(e) => setPf({ ...pf, voice: e.target.value })} />
-          )}
-          <input className="border rounded px-2 py-1 col-span-2" placeholder="Base URL（媒体档位必填，如 http://127.0.0.1:10188）"
-            value={pf.base_url} onChange={(e) => setPf({ ...pf, base_url: e.target.value })} />
-          <input className="border rounded px-2 py-1 col-span-2 mono text-xs" type="text"
-            style={showKey ? undefined : { WebkitTextSecurity: "disc" } as React.CSSProperties}
-            placeholder="API Key（本地 ComfyUI 不用填）" value={pf.api_key}
-            autoComplete="off" spellCheck={false}
-            onPaste={(e) => {
-              e.preventDefault();
-              setPf((cur) => ({ ...cur, api_key: cleanKey(e.clipboardData.getData("text")) }));
-            }}
-            onChange={(e) => setPf({ ...pf, api_key: cleanKey(e.target.value) })} />
-          <div className="col-span-2 flex items-center gap-2">
-            <button className="ga-btn ga-btn-primary" onClick={createProfile}>添加档位</button>
-            {err && <span className="text-xs text-red-600">{err}</span>}
-            <span className="text-[11px] text-slate-400">
-              {pf.kind === "image"
-                ? "图像档位创建后在「智能体」页绑定为助手的美术模型；出图失败时会用档位参数直通生图。"
-                : "音频档位创建后在「智能体」页绑定为助手的配音模型，文案走 /audio/speech 合成。"}
-            </span>
-          </div>
-        </div>
-
-        <div className="mt-3 space-y-2">
-          {mediaProfiles.map((p) => (
-            <div key={p.id} className="rounded border border-slate-200 p-3 flex items-center gap-3 text-sm flex-wrap">
-              <span className={`text-[10px] px-1.5 py-0.5 rounded shrink-0 ${
-                p.kind === "image" ? "bg-sky-100 text-sky-700" : "bg-amber-100 text-amber-700"}`}>
-                {p.kind === "image" ? "图像" : "音频"}
-              </span>
-              <span className="font-medium">{p.label}</span>
-              <span className="text-[11px] mono text-slate-400">{p.key}</span>
-              <span className="text-xs text-slate-500">{p.provider}{p.model ? ` / ${p.model}` : ""}</span>
-              {p.has_key && (
-                <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700">
-                  Key {p.key_hint}
-                </span>
-              )}
-              {p.bound_roles.length > 0 && (
-                <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700">
-                  {p.bound_roles.map((r) => ROLE_NAMES[r] || r).join("、")} 在用
-                </span>
-              )}
-              {p.params_json?.voice && (
-                <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-600">
-                  音色 {p.params_json.voice}
-                </span>
-              )}
-              {p.base_url && (
-                <span className="text-[11px] text-slate-400 mono truncate max-w-[260px]">{p.base_url}</span>
-              )}
-              <button className="ml-auto ga-btn ga-btn-danger ga-btn-sm"
-                onClick={async () => { await api.deleteModelProfile(p.id); refresh(); }}>
-                删除
-              </button>
-            </div>
-          ))}
-          {mediaProfiles.length === 0 && (
-            <div className="text-xs text-slate-400">暂无图像 / 音频档位；未配置时图像/音频使用本地占位生成。</div>
           )}
         </div>
       </div>
@@ -854,9 +722,10 @@ export default function ModelConfigTab({ profiles, providers, refresh }: Props) 
   );
 }
 
-/** 供父组件加载：配置页同时要用档位列表填「智能体」页的绑定下拉。 */
-export async function loadModelConfig() {
-  const [pr, pv] = await Promise.all([api.modelProfiles(), api.llmProviders()]);
+/** 供父组件加载：配置页同时要用档位列表填「智能体」页的绑定下拉。
+ *  带 projectId 时返回「团队默认 + 该项目专属」档位（同名 key 项目行优先由后端保证）。 */
+export async function loadModelConfig(projectId = "") {
+  const [pr, pv] = await Promise.all([api.modelProfiles(projectId), api.llmProviders()]);
   return { profiles: (pr.profiles || []) as ModelProfileRow[],
            providers: (pv.providers || []) as LlmProviderRow[] };
 }

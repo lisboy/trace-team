@@ -7,18 +7,27 @@
 实现要点（安全第一）：
   * SQLite 正在被本进程写，**不能直接复制 .db 文件**（可能读到写了一半的页）。
     用 sqlite3 的在线 backup API 做一致性快照。
+  * Linux 团队包的内置 MariaDB 数据目录就在 ``<DATA_DIR>/mysql``，同样不能在线复制。
+    迁移流程：先复制其余文件（库继续服务）→ 停库 → 复制 mysql/ → 用包内 db.sh
+    从新目录把库起起来。任何一步失败都把库从旧目录重新拉起，旧数据不动。
   * 迁移 = 先把整个数据目录复制到新位置，复制并校验成功后才写「指针文件」
     （`~/.trace_location`），并写一个待清理标记；旧目录**不在迁移时删**，
     等新实例用新目录正常启动、DB 打开成功后，再由启动逻辑删除旧目录。
     这样中途失败/新目录不可用，都还能退回旧目录，不会把数据弄丢。
   * 指针文件放在固定位置（用户主目录 / 打包版 exe 目录），不能放进数据目录自身——
     否则目录一搬走就记不住了。
+  * 安装脚本会把当前数据目录写进 .env 的 GA_DATA_DIR。这种情况迁移要允许，
+    成功后同步改写 .env（否则重启后脚本还在旧目录起库）；只有 shell/systemd
+    注入的真环境变量才拒绝——那个改不了。
 """
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
 import sqlite3
+import stat
+import subprocess
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -32,10 +41,17 @@ from game_agent.config import (
     PENDING_CLEANUP_FILENAME,
     _DEFAULT_DATA_DIR,
     data_dir_env_override,
+    data_dir_source,
+    env_file_path,
+    is_mysql,
     read_data_dir_pointer,
+    rewrite_env_data_dir,
     write_data_dir_pointer,
 )
 from game_agent.core.context import RequestContext
+from game_agent.core.instance_lock import INFO_FILENAME as _INSTANCE_INFO
+from game_agent.core.instance_lock import LOCK_FILENAME as _INSTANCE_LOCK
+from game_agent.core.instance_lock import PIDFILE_NAME as _PIDFILE
 from game_agent.logging_setup import get_logger
 from game_agent.platform_ui import picker_supported
 
@@ -48,6 +64,15 @@ router = APIRouter(prefix="/api", tags=["storage"])
 # 待清理标记：迁移成功后在**新**目录里写一份「旧目录路径」，启动时据此删除旧目录
 PENDING_CLEANUP_FILE = PENDING_CLEANUP_FILENAME
 _SQLITE_SUFFIXES = (".db", ".db-wal", ".db-shm")
+# 运行时状态文件：不属于数据，而且正被本进程占用（Windows 上锁着，复制会 WinError 33）。
+# 搬过去还会让新实例误判「已有实例在跑」，所以一律跳过。
+_RUNTIME_FILES = frozenset({
+    PENDING_CLEANUP_FILE,
+    _INSTANCE_LOCK,
+    _INSTANCE_INFO,
+    _PIDFILE,
+    ".trace_write_test",
+})
 
 # 迁移是「整目录复制」的分钟级动作，同一时刻只允许一次：
 # 连点两下会启动两轮复制，后一轮把前一轮刚建出来的目录判成「非空」直接失败，
@@ -109,7 +134,7 @@ class MigrateProgress:
             end = self.finished_at or time.time()
             elapsed = max(0.0, end - self.started_at)
         pct = None
-        if self.phase in ("copy", "db"):
+        if self.phase in ("copy", "copydb", "db"):
             # 扫描阶段总大小还没算完 → 不给百分比（前端显示「不确定」滚动条）
             if self.total_bytes > 0:
                 pct = min(99.9, self.done_bytes * 100.0 / self.total_bytes)
@@ -169,6 +194,100 @@ def _is_default(d: Path) -> bool:
     return str(d).lower() == str(Path(_DEFAULT_DATA_DIR).expanduser().resolve()).lower()
 
 
+# ------------------------------------------------------------ 内置 MariaDB（Linux 包）
+# <DATA_DIR>/mysql 是包内 MariaDB 的 datadir（里面还有一层 mysql 系统库）。
+# 在线复制 InnoDB 文件必然不一致，所以迁移时必须先停库、复制、再从新目录起库。
+def _local_db_dir() -> Path | None:
+    if not is_mysql():
+        return None
+    d = DATA_DIR / "mysql"
+    return d if (d / "mysql").is_dir() else None
+
+
+def _db_port(data_dir: Path) -> int:
+    try:
+        return int((data_dir / "mysql_port").read_text(encoding="utf-8").strip() or 33306)
+    except (OSError, ValueError):
+        return 33306
+
+
+def _port_open(port: int) -> bool:
+    import socket
+
+    s = socket.socket()
+    s.settimeout(1.0)
+    try:
+        s.connect(("127.0.0.1", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def _db_script() -> Path | None:
+    """安装目录里的 scripts/db.sh（提供 db_start/db_stop）。源码运行没有 → None。"""
+    roots: list[Path] = []
+    pkg = (os.environ.get("GA_PKG_DIR") or "").strip()
+    if pkg:
+        roots.append(Path(pkg))
+    try:
+        # 打包版结构：<PKG>/game_agent/api/routers/storage.py
+        roots.append(Path(__file__).resolve().parents[3])
+    except IndexError:  # pragma: no cover - 目录层级异常
+        pass
+    for root in roots:
+        script = root / "scripts" / "db.sh"
+        # runtime/mariadb 是打包版独有目录，避免误用源码仓库里的同名脚本
+        if script.is_file() and (root / "runtime" / "mariadb").is_dir():
+            return script
+    return None
+
+
+def _run_db_sh(func: str, data_dir: Path, timeout: float) -> subprocess.CompletedProcess:
+    """以指定数据目录执行包内 db.sh 的 db_start / db_stop（my.cnf 由它按新目录重写）。"""
+    script = _db_script()
+    if script is None:
+        raise RuntimeError("找不到包内的 scripts/db.sh，无法安全搬迁数据库")
+    pkg = script.parent.parent
+    env = dict(os.environ)
+    env["PKG_DIR"] = str(pkg)
+    env["GA_PKG_DIR"] = str(pkg)
+    env["GA_DATA_DIR"] = str(data_dir)
+    env["GA_DB_SH"] = str(script)
+    return subprocess.run(
+        ["bash", "-c", '. "$GA_DB_SH" && ' + func],
+        capture_output=True, text=True, timeout=timeout, env=env,
+    )
+
+
+def _stop_local_db(data_dir: Path) -> None:
+    r = _run_db_sh("db_stop", data_dir, timeout=90)
+    out = (r.stderr or r.stdout or "").strip()[-300:]
+    if r.returncode != 0:
+        raise RuntimeError(f"停止内置数据库失败：{out}")
+    if _port_open(_db_port(data_dir)):
+        raise RuntimeError(f"内置数据库没停下来（端口 {_db_port(data_dir)} 仍可连接），请稍后重试")
+
+
+def _start_local_db(data_dir: Path) -> None:
+    r = _run_db_sh("db_start", data_dir, timeout=180)
+    out = (r.stderr or r.stdout or "").strip()[-300:]
+    if r.returncode != 0 or not _port_open(_db_port(data_dir)):
+        raise RuntimeError(f"内置数据库启动失败：{out or '端口未就绪'}")
+
+
+def _require_env_file_writable() -> None:
+    pf = env_file_path()
+    if pf is None or not pf.is_file():
+        raise HTTPException(status_code=400, detail="找不到 .env 文件，无法同步新的数据目录")
+    if not os.access(pf, os.W_OK):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{pf} 不可写，无法同步新的数据目录；请用有权限的账号修改 GA_DATA_DIR 后重启再迁移",
+        )
+
+
 @router.get("/system/storage")
 async def get_storage(ctx: RequestContext = Depends(require(PERM_AGENT_CONFIG))):
     """当前数据目录、默认目录、占用大小、所在盘剩余空间、以及等待生效的新目录（若有）。"""
@@ -187,6 +306,11 @@ async def get_storage(ctx: RequestContext = Depends(require(PERM_AGENT_CONFIG)))
         pp = Path(pointer).expanduser().resolve()
         if str(pp).lower() != str(cur).lower():
             pending = str(pp)
+    # 只有真环境变量才叫「钉死」；.env 是安装脚本的记录，迁移会同步改写。
+    # 已迁移、等重启期间 .env 已指向新目录而本进程还在旧目录——别同时弹
+    # 「不会生效」和「重启后生效」两条自相矛盾的提示。
+    source = data_dir_source()
+    pinned = data_dir_env_override() if (source == "env" and not pending) else ""
     return {
         "data_dir": str(cur),
         "default_dir": str(Path(_DEFAULT_DATA_DIR).expanduser()),
@@ -198,7 +322,11 @@ async def get_storage(ctx: RequestContext = Depends(require(PERM_AGENT_CONFIG)))
         "disk_free_human": _human(free),
         "pending_switch_to": pending,  # 非空=已改过目录，重启后生效
         # 非空=数据目录被环境变量 GA_DATA_DIR 钉死了，此时「迁移」不会生效，前端要说明白
-        "env_override_dir": data_dir_env_override(),
+        "env_override_dir": pinned,
+        # 数据目录来源：env|dotenv|pointer|default（前端/日志排查用）
+        "data_dir_source": source,
+        # 带内置 MariaDB（Linux 包）：迁移期间数据库会停一下，前端要提前讲清楚
+        "moves_local_db": _local_db_dir() is not None,
         # 「浏览…」能不能弹出系统原生文件夹窗口；false 时前端回退内置目录浏览器
         "picker_native": picker_supported(),
         "app_running": True,
@@ -259,9 +387,8 @@ def _plan_copy(src: Path) -> list[tuple[Path, Path, int]]:
     """扫一遍源目录，列出要复制的 (源文件, 目标相对路径, 大小)，并累加总字节数。
 
     DB 文件（.db/-wal/-shm）和待清理标记不参与：DB 走 backup 快照，标记不该跟着搬。
+    套接字/FIFO 之类非普通文件跳过（复制会直接报错，比如 MariaDB 的 mysqld.sock）。
     """
-    import os
-
     src_res = src.resolve()
     plan: list[tuple[Path, Path, int]] = []
     for root, dirs, files in os.walk(src_res, followlinks=False):
@@ -271,15 +398,48 @@ def _plan_copy(src: Path) -> list[tuple[Path, Path, int]]:
             if (root_path / d).is_symlink():
                 log.warning("storage migrate: 跳过符号链接目录 %s", root_path / d)
         for name in files:
-            if name in _SQLITE_SUFFIXES or name == PENDING_CLEANUP_FILE:
+            if name in _SQLITE_SUFFIXES or name in _RUNTIME_FILES:
                 continue
             f = root_path / name
             try:
-                size = f.stat().st_size
+                st = f.stat()
             except OSError:
-                continue  # 拷不到的（被占用/权限）交给 copy 阶段报错，别在这里算坏总数
-            plan.append((f, f.relative_to(src_res), size))
+                continue  # 拷不到的（被占用/权限/断链）交给 copy 阶段报错，别在这里算坏总数
+            if not stat.S_ISREG(st.st_mode):
+                log.warning("storage migrate: 跳过非普通文件 %s", f)
+                continue
+            plan.append((f, f.relative_to(src_res), st.st_size))
     return plan
+
+
+def _copy_plan(plan: list[tuple[Path, Path, int]], dst: Path) -> None:
+    for f, rel, size in plan:
+        target = dst / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        PROGRESS.current = str(rel)
+        try:
+            shutil.copy2(f, target)
+        except FileNotFoundError:
+            # 扫描到复制的几分钟里被删掉的临时文件（日志轮转、mysqld 退出时删 pid/socket）。
+            # 不是数据丢失，跳过即可；真拷不动（权限/占用）仍然报错。
+            log.warning("storage migrate: 源文件已消失，跳过 %s", rel)
+            continue
+        except OSError as e:
+            raise RuntimeError(f"复制 {rel} 失败：{e}") from e
+        PROGRESS.done_bytes += size
+        PROGRESS.files_done += 1
+
+
+def _mirror_dirs(src: Path, dst: Path) -> None:
+    """把目录骨架在新位置建出来：空目录也要存在（projects / objects 这类启动时未必重建）。
+    只建目录、不碰文件；符号链接目录不跟，也不伪装成真目录。"""
+    src_res = src.resolve()
+    for root, dirs, _files in os.walk(src_res, followlinks=False):
+        root_path = Path(root)
+        (dst / root_path.relative_to(src_res)).mkdir(parents=True, exist_ok=True)
+        for d in list(dirs):
+            if (root_path / d).is_symlink():
+                dirs.remove(d)
 
 
 def _do_migrate(src: Path, dst: Path) -> None:
@@ -288,10 +448,9 @@ def _do_migrate(src: Path, dst: Path) -> None:
     用「先扫描后复制」两步：扫描拿到总字节数，复制阶段才能算出百分比；
     否则前端只能看到「已完成 N MB」而不知道还剩多少。
     """
-    import os
-
     dst.mkdir(parents=True, exist_ok=True)
     src_res = src.resolve()
+    _mirror_dirs(src_res, dst)
 
     PROGRESS.phase = "scan"
     plan = _plan_copy(src_res)
@@ -301,16 +460,7 @@ def _do_migrate(src: Path, dst: Path) -> None:
     PROGRESS.files_total = len(plan) + (1 if db_size else 0)
 
     PROGRESS.phase = "copy"
-    for f, rel, size in plan:
-        target = dst / rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-        PROGRESS.current = str(rel)
-        try:
-            shutil.copy2(f, target)
-        except OSError as e:
-            raise RuntimeError(f"复制 {rel} 失败：{e}") from e
-        PROGRESS.done_bytes += size
-        PROGRESS.files_done += 1
+    _copy_plan(plan, dst)
 
     # DB 快照（源文件存在才复制）
     if db_size:
@@ -322,16 +472,91 @@ def _do_migrate(src: Path, dst: Path) -> None:
     PROGRESS.current = ""
 
 
+def _migrate_all(src: Path, dst: Path, moving_db: bool) -> None:
+    """执行整份搬迁；moving_db=True 时负责停库/复制 datadir/从新目录起库。
+
+    复制顺序刻意把 mysql/ 放到最后：其余文件复制期间数据库还在服务（几分钟），
+    停库时间只剩 datadir 本身的复制。失败时把库从旧目录重新拉起，旧数据一个字节不动。
+    """
+    dst.mkdir(parents=True, exist_ok=True)
+    if not moving_db:
+        _do_migrate(src, dst)
+        return
+
+    src_res = src.resolve()
+    _mirror_dirs(src_res, dst)
+    PROGRESS.phase = "scan"
+    full = _plan_copy(src_res)
+    app_plan = [p for p in full if p[1].parts[:1] != ("mysql",)]
+    sqlite_db = src_res / _DB_NAME
+    sqlite_size = sqlite_db.stat().st_size if sqlite_db.is_file() else 0
+    PROGRESS.total_bytes = sum(p[2] for p in full) + sqlite_size
+    PROGRESS.files_total = len(full) + (1 if sqlite_size else 0)
+
+    stopped = False
+    started = False
+    try:
+        PROGRESS.phase = "copy"
+        _copy_plan(app_plan, dst)
+
+        PROGRESS.phase = "stopdb"
+        _stop_local_db(src_res)
+        stopped = True
+
+        # 停库后重新扫描：正常退出时会删掉 mysqld.pid / mysqld.sock，
+        # 按停库前的清单复制会直接 FileNotFoundError。
+        PROGRESS.phase = "copydb"
+        db_plan = [p for p in _plan_copy(src_res) if p[1].parts[:1] == ("mysql",)]
+        _copy_plan(db_plan, dst)
+
+        if sqlite_size:  # 从 SQLite 升级来的旧库：顺手留一份一致性快照
+            PROGRESS.phase = "db"
+            PROGRESS.current = _DB_NAME
+            _db_copy(sqlite_db, dst / _DB_NAME)
+            PROGRESS.done_bytes += sqlite_size
+            PROGRESS.files_done += 1
+
+        PROGRESS.phase = "startdb"
+        _start_local_db(dst)
+        started = True
+        PROGRESS.current = ""
+    except Exception:
+        PROGRESS.current = ""
+        if stopped and not started:
+            # 新库可能起了半截占着端口，先收掉再回旧目录起，否则两边抢 127.0.0.1:端口
+            try:
+                _stop_local_db(dst)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                _start_local_db(src_res)
+                log.warning("storage migrate failed: 已从旧目录重新启动内置数据库")
+            except Exception:  # noqa: BLE001
+                log.exception("storage migrate failed and old database could not be restarted")
+        raise
+
+
 @router.post("/system/storage/migrate")
 async def migrate_storage(body: MigrateIn, ctx: RequestContext = Depends(require(PERM_AGENT_CONFIG))):
     """把当前数据目录整体迁移到 target_dir，成功后写指针（重启生效）并标记旧目录待清理。"""
-    # 被环境变量钉死时迁移注定不生效：直接说清楚，别让用户白等一次全量复制
-    env_dir = data_dir_env_override()
-    if env_dir:
+    # 已经迁移过、还没重启：本进程仍在旧目录，再迁一次只会把旧目录再复制一遍。
+    # 说清楚「先重启」，别让用户以为迁移没生效。
+    pointer = read_data_dir_pointer()
+    if pointer:
+        pp = Path(pointer).expanduser().resolve()
+        if str(pp).lower() != str(DATA_DIR.resolve()).lower():
+            raise HTTPException(
+                status_code=409,
+                detail=f"数据目录已迁移到 {pp}，请先重启应用（stop.sh + run.sh）后再操作",
+            )
+    # 真·环境变量（shell/systemd）钉死时迁移注定不生效：直接说清楚，别让用户白等一次全量复制。
+    # .env 里那份是安装脚本的记录，迁移会同步改写，不在此列。
+    if data_dir_source() == "env":
+        env_dir = data_dir_env_override()
         raise HTTPException(
             status_code=400,
             detail=(f"数据目录被环境变量 GA_DATA_DIR 固定为 {env_dir}，在设置页换位置不会生效。"
-                    "请先删掉 .env（或启动脚本）里的 GA_DATA_DIR，再来迁移。"),
+                    "请先删掉启动脚本/systemd 里的 GA_DATA_DIR，再来迁移。"),
         )
     if _MIGRATE_LOCK.locked():
         raise HTTPException(status_code=409, detail="已有一次迁移正在进行，请等它结束再操作")
@@ -395,24 +620,43 @@ async def _migrate_locked(raw: str) -> dict:
     except OSError:
         pass
 
+    # .env 里的 GA_DATA_DIR 是安装脚本的记录：迁移必须能同步改写它，否则重启后
+    # 启动脚本仍在旧目录起库。先确认可写，别等全量复制完才失败。
+    source = data_dir_source()
+    if source == "dotenv":
+        _require_env_file_writable()
+
+    local_db = _local_db_dir()
+    if local_db is not None and _db_script() is None:
+        raise HTTPException(
+            status_code=400,
+            detail="检测到内置数据库，但找不到包内的 scripts/db.sh（请用 run.sh 启动服务），无法安全搬迁数据库",
+        )
+
     log.info("storage migrate start: %s -> %s (%s)", src, target, _human(need))
     PROGRESS.begin(src, target)
     try:
-        await asyncio.to_thread(_do_migrate, src, target)
+        await asyncio.to_thread(_migrate_all, src, target, local_db is not None)
     except Exception as e:  # noqa: BLE001
         log.exception("storage migrate failed")
         PROGRESS.finish(error=str(e))
         # 清掉半成品，避免用户下次选到非空目录
-        try:
-            for child in target.iterdir():
-                shutil.rmtree(child) if child.is_dir() else child.unlink()
-        except Exception:  # noqa: BLE001
-            pass
+        _cleanup_partial(target)
         raise HTTPException(status_code=500, detail=f"迁移失败（旧数据未动）：{e}")
 
-    # 复制成功 → 写指针（重启后使用新目录）+ 在新目录里留下「旧目录待清理」标记
+    # 复制成功 → 先改 .env（下次启动脚本也用新目录），再写指针（重启后使用新目录）
     pointer_arg = "" if _is_default(target) else str(target)
-    write_data_dir_pointer(pointer_arg)
+    try:
+        if source == "dotenv":
+            rewrite_env_data_dir(pointer_arg)
+        write_data_dir_pointer(pointer_arg)
+    except Exception as e:  # noqa: BLE001
+        log.exception("storage migrate: 写数据目录记录失败，开始回滚")
+        PROGRESS.finish(error=str(e))
+        await asyncio.to_thread(_rollback_after_commit_failure, src, target, local_db is not None)
+        raise HTTPException(status_code=500, detail=f"迁移后写入数据目录记录失败，已回退：{e}")
+
+    # 新目录里留下「旧目录待清理」标记，重启确认能打开后再删旧目录
     try:
         (target / PENDING_CLEANUP_FILE).write_text(str(src), encoding="utf-8")
     except Exception:  # noqa: BLE001 - 写不了标记只是不能自动清理旧目录，不影响切换
@@ -420,10 +664,38 @@ async def _migrate_locked(raw: str) -> dict:
 
     log.info("storage migrate done: now=%s (restart to apply)", target)
     PROGRESS.finish()
+    if local_db is not None:
+        message = "数据已复制到新目录，内置数据库已从新位置启动；重启应用后路径生效，重启时会自动清理旧目录。"
+    else:
+        message = "数据已复制到新目录，重启后生效；重启时会自动清理旧目录。"
     return {
         "ok": True,
         "target_dir": str(target),
         "is_default": _is_default(target),
         "need_restart": True,
-        "message": "数据已复制到新目录，重启后生效；重启时会自动清理旧目录。",
+        "moved_local_db": local_db is not None,
+        "env_file_updated": source == "dotenv",
+        "message": message,
     }
+
+
+def _cleanup_partial(target: Path) -> None:
+    try:
+        for child in target.iterdir():
+            shutil.rmtree(child) if child.is_dir() else child.unlink()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _rollback_after_commit_failure(src: Path, target: Path, moved_db: bool) -> None:
+    """配置记录写失败时回滚：库切回旧目录（新库可能已在跑），再清掉新目录里的副本。"""
+    if moved_db:
+        try:
+            _stop_local_db(target)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            _start_local_db(src)
+        except Exception:  # noqa: BLE001
+            log.exception("回滚：旧目录数据库启动失败，请执行 stop.sh 后重新 run.sh")
+    _cleanup_partial(target)

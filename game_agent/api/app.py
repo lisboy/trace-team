@@ -7,9 +7,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 
-from game_agent.api.routers import (artifacts, auth, channels, config, doctor, imagegen, memory,
-                                    prefs, projects, providers, questions, runs, sessions,
-                                    skills, storage, system, videogen, voicegen)
+from game_agent.api.routers import (artifacts, auth, channels, config, doctor, memory,
+                                    prefs, projects, questions, runs, sessions,
+                                    skills, storage, system, team)
 from game_agent.api.routers.ws import router as ws_router
 from game_agent.api.state import state
 
@@ -26,14 +26,11 @@ def create_app(frontend_dir: str | None = None) -> FastAPI:
     )
 
     app.include_router(auth.router)
+    app.include_router(team.router)
     app.include_router(projects.router)
     app.include_router(sessions.router)
     app.include_router(runs.router)
     app.include_router(artifacts.router)
-    app.include_router(imagegen.router)
-    app.include_router(videogen.router)
-    app.include_router(voicegen.router)
-    app.include_router(providers.router)
     app.include_router(memory.router)
     app.include_router(config.router)
     app.include_router(skills.router)

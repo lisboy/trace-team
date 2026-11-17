@@ -44,9 +44,8 @@ def main() -> None:
     if str(exe_dir) not in sys.path:
         sys.path.insert(0, str(exe_dir))
     _ensure_std_streams()
-    # 子命令入口：`Trace.exe --reset-password` 仍走 CLI，但这个版本没有账号密码，
-    # 它只会打印一句「本版本不需要账号密码」。留着是为了老用户/老快捷方式不至于撞上
-    # argparse 报错；`Trace.exe --info` 则能不开服务就查到数据目录/端口。
+    # 子命令入口：`Trace.exe --reset-password [账号]` 重置为 666666（无需旧密码），
+    # `Trace.exe --info` 不开服务就能查数据目录/数据库/端口。
     argv = sys.argv[1:]
     if argv and argv[0] in ("--reset-password", "reset-password", "-rp", "--info", "info"):
         from game_agent.cli import main as cli_main

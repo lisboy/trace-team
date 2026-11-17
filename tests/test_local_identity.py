@@ -108,17 +108,28 @@ def test_deps_context_lists_local_projects(session_factory):
     assert pid in ids
 
 
-def test_login_routes_are_gone():
-    """只有 /me 与 /me/avatar 还在；登录/登出/首启/改密码这些接口已删除。"""
+def test_login_routes_exist():
+    """团队版必须有登录/退出/改密；没有邮箱注册相关接口。"""
     paths = {getattr(r, "path", "") for r in auth_router.router.routes}
-    assert "/api/auth/me" in paths and "/api/auth/me/avatar" in paths
-    for dead in ("/api/auth/login", "/api/auth/logout", "/api/auth/setup",
-                 "/api/auth/status", "/api/auth/me/password", "/api/auth/oidc/providers"):
-        assert dead not in paths, f"{dead} 应该已经删掉（这个版本没有账号密码）"
+    for need in ("/api/auth/login", "/api/auth/logout", "/api/auth/change-password",
+                 "/api/auth/me", "/api/auth/me/avatar"):
+        assert need in paths, f"缺少 {need}"
+    for dead in ("/api/auth/register", "/api/auth/signup", "/api/auth/oidc/providers"):
+        assert dead not in paths
+
+
+def test_context_requires_token_when_auth_enabled(session_factory, monkeypatch):
+    """生产（GA_AUTH_DISABLED 未开）时无令牌必须 401。"""
+    monkeypatch.setenv("GA_AUTH_DISABLED", "0")
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as ei:
+        asyncio.run(get_current_context(_fake_request({})))
+    assert ei.value.status_code == 401
 
 
 def test_me_endpoint_returns_identity_without_login(session_factory):
-    """/api/auth/me 无凭证可读：返回本机用户 + 工作区（前端顶栏昵称/头像靠它）。"""
+    """/api/auth/me 在测试免登录模式可读（生产必须带令牌）。"""
     app = FastAPI()
     app.include_router(auth_router.router)
 

@@ -2,10 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { createPortal } from "react-dom";
 import { api } from "../api";
-import { useAuth } from "../store";
+import { isAdminUser, useAuth } from "../store";
 import { navigate, type Route } from "../router";
 import SessionList from "../components/SessionList";
-import ModelPicker, { DEFAULT_MODEL_CHOICE, type ModelChoice } from "../components/ModelPicker";
 import RunPanel from "../components/RunPanel";
 import Markdown from "../components/Markdown";
 import { ProjectScriptButtons } from "../components/ProjectScriptButtons";
@@ -20,8 +19,8 @@ import { escapeHtml, type CopyPayload } from "../clipboard";
 import { ProjectSocket } from "../ws";
 import { fireNotify, truncBody } from "../notify";
 import { loadQueueImages, saveQueueImages } from "../queueMedia";
-import { ROLE_LABEL, type Message, type PermissionScope, type ProjectSummary, type Session } from "../types";
-import { defaultScope } from "../assistantPolicy";
+import { ROLE_LABEL, type Message, type ProjectSummary, type Session } from "../types";
+import { newUid } from "../uid";
 
 /** UUID 归一比较：runs.session_id 存的是 32 位无横线串，sessions.id 带横线，
  *  直接 === 永远不相等（会导致「正在执行的会话」永远认不出来）。 */
@@ -153,7 +152,7 @@ const QUEUE_MAX_KEEP = 10;
 interface QueuedFile { path: string; name: string; size: number }
 /** imageCount 只在「从 localStorage 读回来」时有值：文字/附件走 localStorage，图片本体走
  *  IndexedDB（见 queueMedia.ts），刷新后由 loadQueueImages 还原；还原不到时才提示重新附上。 */
-interface QueueItem { id: string; content: string; images: string[]; files: QueuedFile[]; imageCount?: number; modelProfile?: string; reasoningEffort?: string; scope?: PermissionScope }
+interface QueueItem { id: string; content: string; images: string[]; files: QueuedFile[]; imageCount?: number }
 
 function queueArchive(): Record<string, QueueItem[]> {
   try {
@@ -174,14 +173,11 @@ function loadQueue(sessionId?: string | null): QueueItem[] {
     .map((q) => {
       const images = Array.isArray(q.images) ? q.images : [];
       return {
-        id: String(q.id || crypto.randomUUID()),
+        id: String(q.id || newUid()),
         content: q.content,
         images,
         files: Array.isArray(q.files) ? q.files : [],
         imageCount: Math.max(Number(q.imageCount) || 0, images.length),
-        modelProfile: typeof q.modelProfile === "string" ? q.modelProfile : "",
-        reasoningEffort: typeof q.reasoningEffort === "string" ? q.reasoningEffort : "",
-        scope: q.scope === "full" ? "full" : "workspace",
       };
     });
 }
@@ -197,9 +193,6 @@ function saveQueue(sessionId: string | null | undefined, items: QueueItem[]): vo
       id: q.id, content: q.content, files: q.files,
       images: [] as string[],
       imageCount: q.images.length || (q.imageCount || 0),
-      modelProfile: q.modelProfile || "",
-      reasoningEffort: q.reasoningEffort || "",
-      scope: q.scope,
     }))
     .filter((q) => q.content.trim() || q.imageCount || q.files.length)
     .filter((q) => JSON.stringify(q).length <= QUEUE_MAX_ITEM);
@@ -226,14 +219,20 @@ function fileKindLabel(kind?: string): string {
 
 /** 系统自动续跑那条「续跑说明」：整段是给组长的指令，几百上千字，
  *  照原样贴在气泡里会把对话冲成一堵墙（用户以为自己发了篇长文）。
- *  收起成一行说明，展开才看原文。 */
-function AutoContinueNote({ text, count }: { text: string; count: number }) {
+ *  收起成一行说明，展开才看原文。
+ *  surveyOnly：上一轮只勘察没落地、**根本没立清单**。这种续跑不能再写「清单还有
+ *  若干项」——清单不存在，用户按这句话去翻会找不到（实测 2026-11-13 续跑那轮
+ *  整轮都在找「磁盘上没有痕迹的那 1 项」）。 */
+function AutoContinueNote({ text, count, surveyOnly }:
+  { text: string; count: number; surveyOnly?: boolean }) {
   const [open, setOpen] = useState(false);
   return (
     <div className="ga-auto-continue mx-auto max-w-2xl rounded-lg border border-amber-200 px-3 py-2">
       <div className="flex items-center justify-between gap-2">
         <span className="text-[12.5px] text-amber-800">
-          ⏩ 系统自动续跑：上一轮清单还有 {count || "若干"} 项没做完，已排队接着做
+          {surveyOnly
+            ? "⏩ 系统自动续跑：上一轮只勘察没落地，已排队接着做"
+            : `⏩ 系统自动续跑：上一轮清单还有 ${count || "若干"} 项没做完，已排队接着做`}
         </span>
         <button
           className="shrink-0 text-[11.5px] text-amber-700 underline underline-offset-2 hover:text-amber-900"
@@ -319,6 +318,7 @@ function MessageItem({
         <AutoContinueNote
           text={m.meta?.brief || m.content}
           count={Number(m.meta?.open_count) || 0}
+          surveyOnly={Boolean(m.meta?.survey_only)}
         />
       </div>
     );
@@ -572,6 +572,7 @@ function ImageLightbox({
 
 export default function Chat({ route }: { route: Route }) {
   const currentTeamId = useAuth((s) => s.currentTeamId);
+  const isAdmin = useAuth((s) => isAdminUser(s.user));
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   // 工作区列表到位了吗：没到位之前不能判定「没有项目」去自动建默认工作区，
   // 否则首帧的空数组会被误解成「工作区下确实没项目」，每次进对话都白建一个。
@@ -651,7 +652,6 @@ export default function Chat({ route }: { route: Route }) {
   const [showJump, setShowJump] = useState(false);
   // 会话用量条刷新信号（run 结束/新任务开始时 +1，触发 SessionUsage 重新拉聚合值）
   const [usageKey, setUsageKey] = useState(0);
-  // 顶栏读数区的「让位等级」：0=全显示 1=收起本机余量 2=用量条只留 token/上下文 3=只留右侧操作按钮。
   // 顶栏读数区的「让位等级」：0=全显示 1=用量条收起速度/缓存命中 2=再收起本机余量
   // 3=再收起整条用量条 4=只留右侧操作按钮。
   // 右上角面板可拖宽（最窄时中栏只剩 ~820px），读数三条加起来放不下会把「复制会话/导出记录」
@@ -671,69 +671,6 @@ export default function Chat({ route }: { route: Route }) {
   const skillBtnRef = useRef<HTMLButtonElement>(null);
   const skillPanelRef = useRef<HTMLDivElement>(null);
   const [skillPos, setSkillPos] = useState<{ left: number; bottom: number } | null>(null);
-  // 运行选项（会话权限）：从顶栏挪到输入区，平时收起，别一直占着工具栏
-  const [runOptsOpen, setRunOptsOpen] = useState(false);
-  // 运行选项弹层改为 portal 到 body：开壁纸后祖先的 backdrop-filter 会把 fixed 定位的
-  // 遮罩困在局部包含块里，点到别处关不掉。portal 后要用按钮的屏幕坐标自己定位。
-  const runOptsBtnRef = useRef<HTMLButtonElement>(null);
-  const runOptsPanelRef = useRef<HTMLDivElement>(null);
-  const [runOptsPos, setRunOptsPos] = useState<{ left: number; bottom: number } | null>(null);
-  // 运行中改运行选项 → 立刻推给正在跑的 run（下一轮生效），而不是只改本地状态。
-  // 后端把 permission_scope 写回 run 选项并推进 steering 邮箱，runtime
-  // 下一轮开头重算权限作用域（以前只在开跑时读一次，中途改了不生效）。
-  function pushSettingsToRun(s: { permission_scope?: string }) {
-    if (!runningRunId) return;
-    api.steerRun(runningRunId, "", [], [], "", undefined, s)
-      .then((r: any) => {
-        if (r && r.delivered === false) {
-          setErr("本轮执行刚刚结束，运行选项将在下一条消息生效");
-        }
-      })
-      .catch((e: any) => setErr(e?.message || "运行选项同步失败"));
-  }
-  function toggleRunOpts() {
-    if (runOptsOpen) { setRunOptsOpen(false); return; }
-    const r = runOptsBtnRef.current?.getBoundingClientRect();
-    if (r) {
-      const W = 320, M = 12;
-      setRunOptsPos({
-        left: Math.max(M, Math.min(r.left, window.innerWidth - W - M)),
-        bottom: Math.max(M, window.innerHeight - r.top + 8),
-      });
-    }
-    setRunOptsOpen(true);
-  }
-  // 打开时：Esc / 窗口缩放 / 任何滚动 → 关掉（弹层定位是打开那一刻的快照，滚动后会错位）
-  useEffect(() => {
-    if (!runOptsOpen) return;
-    const close = () => setRunOptsOpen(false);
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") close(); };
-    // 点弹层与按钮之外：用捕获阶段自己判，比整屏透明遮罩更可靠（壁纸模式下祖先
-    // backdrop-filter 会裁剪/错位 fixed 遮罩，导致点别处关不掉——用户实测的第二个问题）。
-    const onDown = (e: MouseEvent) => {
-      const t = e.target as Node | null;
-      if (!t) return;
-      if (runOptsPanelRef.current?.contains(t)) return;   // 点面板内部：不动
-      if (runOptsBtnRef.current?.contains(t)) return;     // 点按钮：交给 onClick 切换
-      close();
-    };
-    // 面板本身可滚（max-h-[75vh] overflow-auto）：滚面板内容不能当成「底层滚动」关掉
-    const onScroll = (e: Event) => {
-      const t = e.target as Node | null;
-      if (t && (t === runOptsPanelRef.current || runOptsPanelRef.current?.contains(t))) return;
-      close();
-    };
-    window.addEventListener("resize", close);
-    window.addEventListener("keydown", onKey);
-    window.addEventListener("scroll", onScroll, true);
-    document.addEventListener("mousedown", onDown, true);
-    return () => {
-      window.removeEventListener("resize", close);
-      window.removeEventListener("keydown", onKey);
-      window.removeEventListener("scroll", onScroll, true);
-      document.removeEventListener("mousedown", onDown, true);
-    };
-  }, [runOptsOpen]);
   // 顶栏读数区让位：容器一溢出就升一级（少显示一组读数），直到放得下。
   // 反方向不自动降级（否则会在两级之间来回跳），只有顶栏明显变宽时才重置重测。
   useEffect(() => {
@@ -774,110 +711,8 @@ export default function Chat({ route }: { route: Route }) {
     return () => ro.disconnect();
   }, []);
 
-  // 模型选择（图三/图四）：输入框右下角胶囊，按会话记住；空=跟随角色绑定档位
-  const [modelChoice, setModelChoice] = useState<ModelChoice>(DEFAULT_MODEL_CHOICE);
-  const modelKeyRef = useRef<string>("ga_model_choice:draft");
-  useEffect(() => {
-    const key = session && session.id !== "__new__" ? `ga_model_choice:${session.id}` : "ga_model_choice:draft";
-    if (modelKeyRef.current === key) return;
-    modelKeyRef.current = key;
-    try {
-      const raw = localStorage.getItem(key);
-      if (raw) {
-        const p = JSON.parse(raw);
-        setModelChoice({ profile: String(p.profile || ""), effort: String(p.effort || "") });
-      } else {
-        const draft = key !== "ga_model_choice:draft"
-          ? localStorage.getItem("ga_model_choice:draft") : null;
-        if (draft) {
-          localStorage.setItem(key, draft);
-          localStorage.removeItem("ga_model_choice:draft");
-          const p = JSON.parse(draft);
-          setModelChoice({ profile: String(p.profile || ""), effort: String(p.effort || "") });
-        } else {
-          setModelChoice(DEFAULT_MODEL_CHOICE);
-        }
-      }
-    } catch {
-      setModelChoice(DEFAULT_MODEL_CHOICE);
-    }
-  }, [session?.id]);
-  function setModelPick(v: ModelChoice, silent?: boolean) {
-    setModelChoice(v);
-    try { localStorage.setItem(modelKeyRef.current, JSON.stringify(v)); } catch { /* ignore */ }
-    // 手点切换 = 同时改「设置 → 智能体 → 助手」的默认：默认模型对没单独选过模型的会话生效，
-    // 设置页也就跟这里看到的一致（以前两处各管各的，聊天里换了模型设置页纹丝不动）。
-    // 选「跟随默认」（profile 为空）时不动默认值——否则等于把默认清空，会掉回 .env 全局端点。
-    if (!silent) {
-      const patch: Record<string, any> = { params_json: { reasoning_effort: v.effort || "" } };
-      if (v.profile) patch.model_profile_key = v.profile;
-      api.updateAgent("main", patch)
-        .catch(() => { /* 没有改配置权限：按会话生效即可，不打断对话 */ });
-    }
-    // 执行中用户手点改模型 → 直接切这一轮后续的 LLM（不排队、不新开 run）。
-    // silent=true 是程序化校正（档位被删→清回跟随默认），不该触发切换。
-    if (!silent && runningRunId) {
-      api.steerRun(runningRunId, "", [], [], "", { profile: v.profile, effort: v.effort })
-        .then((r: any) => {
-          if (r && r.delivered === false) {
-            setErr("本轮执行刚刚结束，所选模型将在下一条消息生效");
-          }
-        })
-        .catch((e: any) => setErr(e?.message || "切换模型失败"));
-    }
-  }
-  // 会话权限作用域：仅工作区 / 全部权限。
-  // 已有会话读它自己记着的值（后端 sessions.permission_scope）；
-  // 新会话草稿跟「设置 → 助手行为」里的默认值走（defaultScope() 同步读本地缓存）。
-  const [scope, setScope] = useState<PermissionScope>(() => defaultScope());
-  const scopeKeyRef = useRef<string>("__draft__");
-  // 记住当前打开会话的后端权限值：切权限 / 发送后要同步回 session 对象，
-  // 但 session 对象可能已被新的列表覆盖（例如轮询刷新），所以单独存一份最新值。
-  const sessScopeRef = useRef<PermissionScope | null>(null);
-  useEffect(() => {
-    const sid = session && session.id !== "__new__" ? session.id : "";
-    if (sid) {
-      // 同一个会话也会走到这里：列表刷新 / 别的标签页改了权限 / 发送后重拉会话，
-      // 后端记着的值才是事实源。以前只在「换会话」时才同步，于是在 A 会话切到
-      // 全部权限、切去 B、再切回 A，选择器还停在 B 的值（或发送时的旧快照），
-      // 显示与实际生效的权限不一致。
-      const v = (session?.permission_scope as PermissionScope) || defaultScope();
-      const fresh = scopeKeyRef.current !== sid || sessScopeRef.current !== v;
-      scopeKeyRef.current = sid;
-      sessScopeRef.current = v;
-      if (fresh) setScope(v);
-    } else {
-      scopeKeyRef.current = "";
-      sessScopeRef.current = null;
-      setScope(defaultScope());
-    }
-  }, [session?.id, session?.permission_scope]);
-  // 设置里的默认值变了：草稿态直接跟随；已打开的会话保留自己的值
-  useEffect(() => {
-    const onChanged = () => {
-      if (!scopeKeyRef.current) setScope(defaultScope());
-    };
-    window.addEventListener("ga-policy-changed", onChanged);
-    return () => window.removeEventListener("ga-policy-changed", onChanged);
-  }, []);
-  async function changeScope(v: PermissionScope) {
-    if (v === scope) return;
-    setScope(v);
-    // 执行中切权限 → 立刻推给正在跑的 run（下一轮起工具路径守卫按新作用域放行/拦截）
-    pushSettingsToRun({ permission_scope: v });
-    const sid = session && session.id !== "__new__" ? session.id : "";
-    if (!sid) return; // 新会话草稿：发送时随 chat 带上
-    sessScopeRef.current = v;
-    try {
-      // 已有会话：立即落库。这样「继续 / 自动续跑」即使不经过 chat 接口，
-      // 也按新权限执行（orchestrator 读会话已存值）。
-      await api.updateSession(sid, { permission_scope: v });
-      setSession((cur) => (cur && sameId(cur.id, sid) ? { ...cur, permission_scope: v } : cur));
-      window.dispatchEvent(new Event("ga-sessions-changed"));
-    } catch (e: any) {
-      setErr(e?.message || "切换权限失败");
-    }
-  }
+  // 模型由管理员在「团队」页按项目绑定（projects.model_profile_key），
+  // 助手行为固定「仅工作区」，对话里不再提供模型与权限切换入口。
   // LLM 就绪自检：一眼看出「这轮能不能调到真实大模型」。程序永远走真实模型，
   // 唯一变量是「有没有配好供应商」——没配就在输入框上方提醒去配置。
   const [llmHealth, setLlmHealth] = useState<{
@@ -925,11 +760,12 @@ export default function Chat({ route }: { route: Route }) {
 
   useEffect(refreshProjects, [refreshProjects]);
 
-  // 「对话」是默认落地页，必须开箱就能说话：还没有任何工作区时，
-  // 自动建一个默认工作区并切过去，用户不用先跑去建项目才能发第一条消息。
+  // 「对话」是默认落地页：管理员在还没有任何项目时自动建一个默认项目，开箱就能说话。
+  // 开发/需求的项目由管理员分派，这里不替他们建（后端也不允许），只显示提示。
   // 只在列表确实加载完、且确实为空时做一次；建失败就停下，让用户手动新建。
   useEffect(() => {
     if (!projectsLoaded || !currentTeamId || projects.length > 0) return;
+    if (!isAdmin) return;
     if (autoWsRef.current === currentTeamId) return;
     autoWsRef.current = currentTeamId;
     (async () => {
@@ -949,7 +785,7 @@ export default function Chat({ route }: { route: Route }) {
         // 失败不重试（autoWsRef 已记账），避免每次渲染都打一遍接口
       }
     })();
-  }, [projectsLoaded, currentTeamId, projects.length]);
+  }, [projectsLoaded, currentTeamId, projects.length, isAdmin]);
 
   // 消息拉取的请求序号：连点会话列表时会有多个请求在飞，只允许「最后一次」的结果落地。
   // 否则先发的慢请求（老会话）后到，会把刚点开的新会话内容盖掉/盖成空。
@@ -1367,7 +1203,6 @@ export default function Chat({ route }: { route: Route }) {
     setSession(s);
     // 进入已有会话时同步它挂载的技能（null=跟随项目默认）
     setAttachSkills(Array.isArray(s.skills) ? s.skills : null);
-    // 权限作用域也跟随该会话（见上面的 scope effect）
     navigate("chat", { project: projectOfSession, session: s.id });
   }
 
@@ -1437,7 +1272,7 @@ export default function Chat({ route }: { route: Route }) {
         setErr("最多带 6 个附件");
         break;
       }
-      const localId = crypto.randomUUID();
+      const localId = newUid();
       updateFiles([...filesRef.current, { path: localId, name: f.name, size: f.size, pending: true }]);
       try {
         const r: any = await api.uploadProjectFile(projectId, f);
@@ -1494,40 +1329,29 @@ export default function Chat({ route }: { route: Route }) {
     }
   }
 
-  async function doSend(content: string, imgList: string[], fileList: { path: string; name: string; size: number }[] = [], modelOverride?: ModelChoice, scopeOverride?: PermissionScope) {
+  async function doSend(content: string, imgList: string[], fileList: { path: string; name: string; size: number }[] = []) {
     if ((!content.trim() && !imgList.length && !fileList.length) || !projectId || sendBusy.current) return false;
     sendBusy.current = true;
     setSending(true);
     const version = draftVersion.current;
-    const chosenModel = modelOverride ?? modelChoice;
-    const chosenScope = scopeOverride ?? scope;
     setErr("");
     try {
       const res = await api.chat(
         projectId,
         {
           content,
-          // 模型选择：空=跟随角色绑定，不改变现有行为
-          ...(chosenModel.profile ? { model_profile_key: chosenModel.profile } : {}),
-          ...(chosenModel.effort ? { reasoning_effort: chosenModel.effort } : {}),
           images: imgList,
           files: fileList,
           // 挂载技能：没动过选择器就不传（跟随项目默认）；新会话/老会话都按这份清单生效
           ...(attachSkills !== null ? { skills: attachSkills } : {}),
-          // 权限作用域：只有与「会话已存值」不一致（或新会话）时才带上。
-          // 正常发送不改变已存权限；切了权限会先落库，这里只是双保险。
-          ...(chosenScope !== (sessScopeRef.current ?? chosenScope)
-            ? { permission_scope: chosenScope } : {}),
           // 已有会话则续聊（同一会话历史上下文），新对话/占位符不传
           ...(session && session.id !== "__new__" ? { session_id: session.id } : {}),
         },
-        crypto.randomUUID()
+        newUid()
       );
       if (version !== draftVersion.current) return true;
       const sid = res.session_id;
-      sessScopeRef.current = chosenScope;
-      setSession({ id: sid, title: content.slice(0, 40) || "（附件消息）", created_at: "",
-                   permission_scope: chosenScope });
+      setSession({ id: sid, title: content.slice(0, 40) || "（附件消息）", created_at: "" });
       setActiveRunId(res.run_id);
       setRunningRunId(res.run_id);
       addTrace(res.run_id);
@@ -1565,9 +1389,7 @@ export default function Chat({ route }: { route: Route }) {
       // 连点「排队」：同步锁挡住第二次，避免同一条草稿入队两遍（run 结束后会发两次）。
       if (queueLockRef.current) return;
       queueLockRef.current = true;
-      setQueue((q) => [...q, { id: crypto.randomUUID(), content, images: imgList, files: fileList,
-                                modelProfile: modelChoice.profile, reasoningEffort: modelChoice.effort,
-                                scope }]);
+      setQueue((q) => [...q, { id: newUid(), content, images: imgList, files: fileList }]);
       window.setTimeout(() => { queueLockRef.current = false; }, 500);
     } else if (!await doSend(content, imgList, fileList)) {
       return;
@@ -1666,8 +1488,7 @@ export default function Chat({ route }: { route: Route }) {
     setSteerBusyIds((cur) => (cur.includes(id) ? cur : [...cur, id]));
     try {
       if (!runningRunId) {
-        if (await doSend(item.content, item.images, item.files,
-          { profile: item.modelProfile || "", effort: item.reasoningEffort || "" }, item.scope)) {
+        if (await doSend(item.content, item.images, item.files)) {
           setQueue((q) => q.filter((x) => x.id !== id));
         }
         return;
@@ -1683,8 +1504,7 @@ export default function Chat({ route }: { route: Route }) {
         if (r?.delivered === false) {
           // 这个 run 其实已经结束了：当成普通消息发出去
           setRunningRunId(null);
-          if (await doSend(item.content, item.images, item.files,
-            { profile: item.modelProfile || "", effort: item.reasoningEffort || "" }, item.scope)) {
+          if (await doSend(item.content, item.images, item.files)) {
             setQueue((q) => q.filter((x) => x.id !== id));
           }
           return;
@@ -1734,8 +1554,7 @@ export default function Chat({ route }: { route: Route }) {
       // 图片在刷新后失效的消息不自动发：宁可停在这儿（行上有「点编辑重新附上」），
       // 也不能把用户发的截图悄悄扔掉。
       if (!first.images.length && (first.imageCount || 0) > 0) return;
-      doSend(first.content, first.images, first.files,
-        { profile: first.modelProfile || "", effort: first.reasoningEffort || "" }, first.scope).then((sent) => {
+      doSend(first.content, first.images, first.files).then((sent) => {
         if (sent && !dead) setQueue((q) => q.filter((x) => x.id !== first.id));
       });
     };
@@ -1978,8 +1797,7 @@ export default function Chat({ route }: { route: Route }) {
       // 上次若是 ask_user 的回答（「【回答】…」），重发会把回答当成新需求，组长会从头再问一遍
       // （实测 bug）。continueRun 会把原需求原文、原图、已改文件、计划进度、最后动作一起带给组长。
       if (deadRun) {
-        const res = await api.continueRun(deadRun.id, undefined,
-          { profile: modelChoice.profile, effort: modelChoice.effort });
+        const res = await api.continueRun(deadRun.id);
         setSession({ id: res.session_id, title: session?.title || "继续任务", created_at: "" });
         setActiveRunId(res.run_id);
         setRunningRunId(res.run_id);
@@ -1994,8 +1812,7 @@ export default function Chat({ route }: { route: Route }) {
       if (!lastUserMsg) return;
       const retryImages = await msgImages(lastUserMsg);
       await doSend(lastUserMsg.content || "", retryImages,
-        Array.isArray(lastUserMsg.meta?.files) ? lastUserMsg.meta.files : [],
-        modelChoice);
+        Array.isArray(lastUserMsg.meta?.files) ? lastUserMsg.meta.files : []);
     } catch (e: any) {
       setErr(e?.message || "继续失败，请稍后再试");
     } finally {
@@ -2115,7 +1932,8 @@ export default function Chat({ route }: { route: Route }) {
              {/* 本机余量：跑批/配音/压上下文时先看它还顶不顶得住，不用翻系统日志 */}
              {readLevel < 2 && <SystemMetrics />}
              {session && session.id !== "__new__" && readLevel < 4 && (
-               <SessionUsage sessionId={session.id} refreshKey={usageKey} compact={readLevel >= 1} />
+               <SessionUsage sessionId={session.id} refreshKey={usageKey}
+                  compact={readLevel >= 1} running={!!(runningRunId || session.running)} />
              )}
            </div>
           {session && session.id !== "__new__" && (
@@ -2256,7 +2074,7 @@ export default function Chat({ route }: { route: Route }) {
         </div>
 
         <div className="relative shrink-0 border-t border-slate-200 bg-white p-3">
-          {/* LLM 未就绪横幅：没有可用的模型供应商（没绑档位且 .env 无 Key）——
+          {/* LLM 未就绪横幅：这个工作区/角色没有绑定可用的模型档位（团队版无 .env 兜底）——
               发出去也没法调用大模型。可关闭（每会话记一次），但不会自己消失。 */}
           {llmHealth && !llmHealth.ready && !llmBannerDismissed && (
             <div className="mb-2 rounded-lg border border-rose-300 bg-rose-50/95 px-3 py-2 text-xs text-rose-800">
@@ -2270,8 +2088,8 @@ export default function Chat({ route }: { route: Route }) {
               <div className="flex items-start gap-1.5 pr-6">
                 <span className="mt-0.5 shrink-0">⚠️</span>
                 <div className="leading-5">
-                  <span className="font-medium">还没有可用的模型供应商</span>
-                  <span className="ml-1">（去「设置 → 模型配置」加一个供应商，并把对话模型绑到它）</span>
+                  <span className="font-medium">还没有绑定可用的模型</span>
+                  <span className="ml-1">（先在「设置 → 模型配置」加供应商；对话模型由管理员在「设置 → 智能体」里绑定：作用范围选团队默认，或选某个项目固定该项目用的模型）</span>
                   {llmHealth.issues.length > 0 && (
                     <ul className="mt-1 list-disc pl-4 space-y-0.5">
                       {llmHealth.issues.map((s, i) => <li key={i}>{s}</li>)}
@@ -2502,7 +2320,7 @@ export default function Chat({ route }: { route: Route }) {
                 >
                     <div className="text-xs font-medium px-1 pb-1">挂载技能（渐进式披露）</div>
                     <label className="flex items-center gap-2 px-1 py-1.5 rounded hover:bg-slate-50 cursor-pointer border-b border-slate-100">
-                      <input
+                      <input autoComplete="off"
                         type="checkbox"
                         checked={attachSkills === null}
                         onChange={() => setAttachSkills(null)}
@@ -2521,7 +2339,7 @@ export default function Chat({ route }: { route: Route }) {
                           className="flex items-start gap-2 px-1 py-1 rounded hover:bg-slate-50 cursor-pointer"
                           title={sk.description}
                         >
-                          <input
+                          <input autoComplete="off"
                             type="checkbox"
                             className="mt-0.5"
                             checked={attachSkills?.includes(sk.name) ?? false}
@@ -2546,83 +2364,6 @@ export default function Chat({ route }: { route: Route }) {
                 document.body,
               )}
             </div>
-            <div className="relative shrink-0">
-              <button
-                ref={runOptsBtnRef}
-                className={`h-9 w-9 rounded border flex items-center justify-center relative ${
-                  scope === "full"
-                    ? "border-amber-300 bg-amber-50 text-amber-700"
-                    : "border-slate-200 text-slate-500 hover:bg-slate-50"
-                }`}
-                title={
-                  scope === "full"
-                    ? "运行选项：会话权限为「全部权限」（可访问工作区外）"
-                    : "运行选项（会话权限）"
-                }
-                aria-label="运行选项"
-                aria-expanded={runOptsOpen}
-                onClick={toggleRunOpts}
-              >
-                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M4 7h9M18.5 7H20M4 17h3M12.5 17H20" />
-                  <circle cx="15.5" cy="7" r="2.2" />
-                  <circle cx="9.5" cy="17" r="2.2" />
-                </svg>
-                {scope === "full" && (
-                  <span className="absolute -top-1 -right-1 h-2 w-2 rounded-full bg-amber-500" />
-                )}
-              </button>
-              {runOptsOpen && runOptsPos && createPortal(
-                <>
-                  <div className="fixed inset-0 z-50" onClick={() => setRunOptsOpen(false)} />
-                  <div
-                    ref={runOptsPanelRef}
-                    className="fixed z-[60] w-80 max-h-[75vh] overflow-auto rounded-lg border border-slate-200 bg-white shadow-xl p-3"
-                    style={{
-                      left: runOptsPos.left,
-                      bottom: runOptsPos.bottom,
-                      backgroundColor: "rgb(var(--ga-panel-rgb))",
-                    }}
-                  >
-                    <div className="text-[11px] font-medium text-slate-500 pb-1">会话权限</div>
-                    <label className="flex items-start gap-2 px-1 py-1.5 rounded hover:bg-slate-50 cursor-pointer">
-                      <input
-                        type="radio"
-                        className="mt-1"
-                        name="ga-scope"
-                        checked={scope === "workspace"}
-                        onChange={() => changeScope("workspace")}
-                      />
-                      <span>
-                        <span className="text-[12.5px] font-medium">仅工作区</span>
-                        <span className="block text-[11px] text-slate-500 leading-relaxed">
-                          读写/解析工具只能碰当前项目工作区内（默认，最安全）。
-                        </span>
-                      </span>
-                    </label>
-                    <label className="flex items-start gap-2 px-1 py-1.5 rounded hover:bg-slate-50 cursor-pointer">
-                      <input
-                        type="radio"
-                        className="mt-1"
-                        name="ga-scope"
-                        checked={scope === "full"}
-                        onChange={() => changeScope("full")}
-                      />
-                      <span>
-                        <span className="text-[12.5px] font-medium">全部权限</span>
-                        <span className="block text-[11px] text-slate-500 leading-relaxed">
-                          允许访问工作区外的本机文件（项目外的脚本、依赖、配置）。系统关键目录仍被保护。
-                        </span>
-                      </span>
-                    </label>
-                    <div className="text-[10px] text-slate-400 px-1 pt-0.5">
-                      每个会话单独生效；新会话默认值在「设置 → 助手行为」里调。
-                    </div>
-                  </div>
-                </>,
-                document.body,
-              )}
-            </div>
             <button
               className="shrink-0 h-9 w-9 rounded border border-slate-200 text-slate-500 hover:bg-slate-50 flex items-center justify-center"
               title="添加图片或文件（图片最多 4 张、文件最多 6 个，也可粘贴截图/拖入）"
@@ -2634,7 +2375,7 @@ export default function Chat({ route }: { route: Route }) {
                 <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48" />
               </svg>
             </button>
-            <input
+            <input autoComplete="off"
               ref={fileRef}
               type="file"
               multiple
@@ -2664,8 +2405,7 @@ export default function Chat({ route }: { route: Route }) {
                 }
               }}
             />
-            {/* 模型选择：输入框右下的「模型名 + 推理等级」胶囊（图三/图四） */}
-            <ModelPicker value={modelChoice} onChange={setModelPick} disabled={sending} />
+            {/* 模型由管理员按项目绑定，输入框不再提供模型切换 */}
             {/* 执行中：输入框空着 → 主键就是「停止」；有草稿 → 主键「排队」，左边补一个小停止键。
                 这里排的是**同一条会话**里的下一条；别的会话各自独立执行，不会被这里挡住。 */}
             {runningRunId && !hasDraft && (

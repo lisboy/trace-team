@@ -1,14 +1,6 @@
 #!/usr/bin/env bash
-# deploy/unix/package.sh —— 打包发布物：构建前端 + 收集后端 wheel/源码包。
-set -e
-cd "$(dirname "$0")/../.."
-
-echo "[1/3] 前端构建 -> web/dist"
-( cd frontend && npm install && npm run build )
-
-echo "[2/3] 构建后端分发包"
-python -m pip install -q build
-python -m build -o dist/
-
-echo "[3/3] 完成。产物：dist/*.whl 与 web/dist/"
-ls -la dist/ web/dist/
+# deploy/unix/package.sh —— 打「解压即用」的 Linux 团队版部署包。
+# 真正的构建逻辑在 packaging/linux-team/build-package.sh（需要 Linux x86_64 构建机）。
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+exec bash "$ROOT/packaging/linux-team/build-package.sh" "$@"

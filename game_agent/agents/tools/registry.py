@@ -12,18 +12,11 @@ from game_agent.agents.tools.native import (
     delete_file, edit_file, glob, grep, list_dir, load_skill, memory_read, read_file,
     run_command, save_env_fact, search_history, write_file,
 )
-from game_agent.agents.tools.collaboration import (
-    generate_audio, generate_image as generate_image_batch,
-    generate_video as generate_video_batch, report_to_user,
-)
+from game_agent.agents.tools.collaboration import report_to_user
 from game_agent.agents.tools.documents import parse_document
 from game_agent.agents.tools.service import (
     screenshot_page, service_logs, start_service, stop_service, view_image,
     view_images,
-)
-from game_agent.agents.tools.specialized import (
-    design_voice, edit_image, generate_music, generate_sfx, list_voice_presets,
-    save_character_sheet, tts, upsert_voice_profile,
 )
 from game_agent.agents.tools.plan import update_plan
 from game_agent.agents.tools.question import AskUserStop, ask_user
@@ -52,20 +45,9 @@ TOOL_IMPLS: dict[str, Callable] = {
     "report_to_user": report_to_user,
     # 子agent 并行：把互不依赖的调研/核对拆成多个只读子agent并发执行
     "spawn_agents": spawn_agents,
-    # 媒体直连：出图（批量版，支持 items）/ 出音频（voice/sfx/music + 音色设计）/ 出视频
-    "generate_image": generate_image_batch, "generate_audio": generate_audio,
-    "generate_video": generate_video_batch,
-    "list_voice_presets": list_voice_presets,
     # 计划机制（助手维护待办清单）
     "update_plan": update_plan,
     "ask_user": ask_user,
-    # 图像辅助（出图本体 generate_image 在上面直连注册）
-    "edit_image": edit_image,
-    "save_character_sheet": save_character_sheet,
-    # 配音
-    "tts": tts, "generate_sfx": generate_sfx, "generate_music": generate_music,
-    "upsert_voice_profile": upsert_voice_profile,
-    "design_voice": design_voice,
 }
 
 _STR = {"type": "string"}
@@ -102,7 +84,9 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "list_dir": {"description": "列出目录内容", "parameters": {
         "type": "object", "properties": {"path": _STR}}},
     "parse_document": {"description": "解析工作区里的 xlsx / docx / pdf 为文本（xlsx 所有列转 TSV 并标行号，"
-                                       "docx 按正文段落/表格原顺序，pdf 每次只提取一页、默认第 1 页）。"
+                                       "pdf 每次只提取一页、默认第 1 页）。docx 除正文段落/表格外还会给出"
+                                       "图片（导出到 .trace/docx-assets/ 并用 view_image 查看）、内嵌 Excel（展开成 TSV）、"
+                                       "图表数值、文本框、批注、页眉页脚。"
                                        "用 offset/limit 按字符分页，按末尾提示继续；不要用 read_file 读这些二进制文件", "parameters": {
         "type": "object", "properties": {
             "path": {**_STR, "description": "工作区内相对路径"},
@@ -226,140 +210,6 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "url": {**_STR, "description": "完整 http(s) 地址"},
             "max_chars": {**_INT, "description": "正文字符上限（默认 6000，最大 20000）"}},
         "required": ["url"]}},
-    "generate_image": {"description": (
-        "直接生成真实图片（用户要图/立绘/卡面/头像/场景/图标/UI 素材时调用）。"
-        "**要出多张（≥2）时用一次本工具 + items 或 count**：工具内部会串行一张一张出完，"
-        "再把全部路径一次回报给你，界面上实时显示进度。不要为多张图反复单独调用，"
-        "也不要先扫代码/文件再决定。"
-        "prompt 写全主体+场景+构图+风格+光照；size 如 1024x1024 / 512x256；"
-        "**高分辨率也支持**：可直接要 2360x1640（≈3.9MP，8G 显存约 5 分钟）等 2K 级尺寸；"
-        "超过约 4MP（如 4K 3840x2160）会自动「基准分辨率采样 + 放大」两段式出图避免爆显存（更快但不增细节）；"
-        "category 建议按用途（ui/character/illustration/scene）；"
-        "需要透明底传 transparent=true；有参考图传 reference（工作区相对路径），"
-        "reference_mode=style 只取画风（默认）或 img2img 以参考图重绘。"
-        "**img2img 的重绘度由你按这次要改多少自己定 reference_denoise**（0~1，越大改动越多、"
-        "越不保留原图）：只想小改（改颜色/加配饰/微调表情）用 0.3~0.45；要换背景/换动作/换场景但保住脸和主体"
-        "用 0.5~0.65；只借参考图起个手、主体可明显变化用 0.75~0.9。不传则用服务默认（偏低≈0.42，"
-        "基本保留原图，强改背景之类会改不动）。"
-        "**项目已在素材库绑定了生图预设时，尺寸/LoRA/画风会被项目预设强制覆盖**，"
-        "你传的 size 不生效；回报里会注明所用的预设名，不要声称用了别的尺寸。"
-        "negative_prompt 传逆提示词（要避免的元素）；不传用服务默认负面词。"
-        "**多视角/八方画像**：要一个人物的所有方向参考图（正面/左右侧/背后/各45°/俯视/仰视）时，"
-        "传 views=[...]（视角 key：front/right/back/left/front_right_45/back_right_45/back_left_45/"
-        "front_left_45/top/bottom，或 \"all\" 表示标准8方位），工具会按视角逐张串行出图，"
-        "同一人物同一画风、只变观察方向，并自动给每个视角加文件名后缀。views 与 count 二选一。"
-        "items=[{slug,prompt,size,category,transparent,reference,views,negative_prompt}] 一次最多 24 项；"
-        "count=N 表示同一套参数出 N 张（slug 自动加序号）。"), "parameters": {
-        "type": "object", "properties": {
-            "prompt": _STR, "slug": _STR, "size": _STR, "category": _STR,
-            "transparent": _BOOL, "reference": _STR,
-            "reference_mode": {**_STR, "description": "style（默认）| img2img"},
-            "reference_denoise": {**_STR, "description": "img2img 重绘度 0~1：0.3~0.45 小改(保构图)、0.5~0.65 换背景/改动作(保脸与主体)、0.75~0.9 大改；不传用服务默认(≈0.42，强改背景会改不动)"},
-            "negative_prompt": {**_STR, "description": "逆向提示词：要避免的元素（如 多余手指、文字、水印、低清）；不传用服务默认"},
-            "views": {**_STR, "description": "多视角/八方画像：视角 key 逗号分隔（front,left,back…）或 all=标准8方位；给了就逐张出各视角，忽略 count"},
-            "count": _INT,
-            "items": {"type": "array", "description": "要出的图清单，顺序即出图顺序",
-                      "items": {"type": "object", "properties": {
-                          "slug": _STR, "prompt": _STR, "size": _STR,
-                          "category": _STR, "transparent": _BOOL,
-                          "reference": _STR, "reference_mode": _STR,
-                          "reference_denoise": _STR, "negative_prompt": _STR,
-                          "views": _STR, "note": _STR}}}},
-        "required": ["prompt"]}},
-    "generate_video": {"description": (
-        "直接生成真实视频（动态素材/过场动画/镜头片段/角色动作演示时调用）。"
-        "走本地 ComfyUI（Wan2.2 TI2V 5B，原生 24fps 出片、自动补到 60fps 顺滑，8G 可跑，单条约 2–5 分钟）。"
-        "prompt 写全主体+动作+镜头运动+场景+风格+光照；不要指望文字清晰（视频模型不擅长写字）。"
-        "**漫剧/角色镜头要稳不要猛**：动作幅度宁小勿大（眨眼、轻微转头、衣袂飘动即可），"
-        "prompt 里点明「保持原图画风/二次元插画风、背景延续原图」，别让模型把 2D 立绘画成 3D 塑料手办；"
-        "单段控制在 3–6 秒，长镜头拆成多段短片段分别生成再拼接，能显著减少脸部扭曲与画面漂移。"
-        "**有角色参考图一定要传 reference**（工作区相对路径）→ 以该图为**首帧**做图生视频，"
-        "按目标宽高等比缩放（不裁脸、透明底自动铺浅灰底防黑背景），是锁住人物外貌最有效的手段；不传 → 文生视频。"
-        "size 如 832x480；duration_s 秒数（帧数按 4n+1 收敛）；fps 默认 24。"
-        "**要更长、更连贯的单镜头用接龙**：传 segments（段数，每段默认 1 秒）——逐段以上一段"
-        "**最后一帧**为首帧续写，串成任意长且动作/画面连贯的长片（比一次生成超长片段更稳、不爆显存）；"
-        "接龙时各段共用同一条 prompt（描述整段的连续动作），segments 即总秒数，最多 30 段。"
-        "category 建议 cutscene/loop/banner 等。"
-        "**要出多条时用一次本工具 + items 或 count**（单条 2–5 分钟，最多 6 条），"
-        "工具内部串行一条一条出完再一次性回报全部路径，界面实时显示进度；不要为多条反复单独调用。"
-        "items=[{slug,prompt,size,category,reference,duration_s,frames,segments}] 一次最多 6 项。"), "parameters": {
-        "type": "object", "properties": {
-            "prompt": _STR, "slug": _STR, "size": _STR, "category": _STR,
-            "reference": {**_STR, "description": "首帧参考图（工作区相对路径），给了就是图生视频；角色镜头强烈建议传"},
-            "duration_s": {**_STR, "description": "时长（秒），会按帧率换算帧数并按 4n+1 收敛；漫剧建议 3–6 秒"},
-            "frames": {**_INT, "description": "直接指定帧数（4n+1 如 17/33/49/81），优先于 duration_s"},
-            "segments": {**_INT, "description": "接龙段数（每段约1秒）：>0 时逐段接上一段尾帧出连贯长片，等于总秒数，最多30"},
-            "segment_seconds": {"type": "number", "description": "接龙每段秒数（默认1，帧数按4n+1取整）"},
-            "fps": {**_INT, "description": "帧率（默认 24，Wan2.2 原生 24fps）"},
-            "count": _INT,
-            "items": {"type": "array", "description": "要出的视频清单，顺序即出片顺序",
-                      "items": {"type": "object", "properties": {
-                          "slug": _STR, "prompt": _STR, "size": _STR, "category": _STR,
-                          "reference": _STR, "duration_s": _STR, "frames": _INT,
-                          "segments": _INT, "note": _STR}}}},
-        "required": ["prompt"]}},
-    "generate_audio": {"description": (
-        "直接生成真实音频（配音/CV/台词/语音/音效/BGM）。"
-        "**任何配音生成都必须用本工具，这是唯一允许的配音入口**："
-        "不许自己 start_service 起 IndexTTS2、"
-        "不许跑 cv_gen.py / gen-cv-indextts.py / cv-presets.py 或自写脚本调语音接口。"
-        "例外：只有用户明确说「按之前 python 脚本的方式生成」才可走老管线。"
-        "kind=voice|sfx|music（默认 voice）：voice 必填 text（要念的台词）；"
-        "sfx/music 必填 prompt（声音描述，如「清脆的按钮点击声」「温柔的主城背景音乐」），"
-        "不需要 text。sfx/music 无外部供应商时由内置合成器产出真实可听音频（provider=synth），"
-        "不再是无声音的静音占位。"
-        "voice 传音色预设名（IndexTTS2 服务端已创建的预设，如「缘·温小令」）："
-        "每个角色用它自己的预设实现一人一嗓，不传则用音频档位默认音色；"
-        "远程 openai_tts 档位则传内置音色名。"
-        "**用户要新音色（不要旧预设/换声线/按文字描述造音色）时**：传 design_desc=音色描述"
-        "（如「妩媚、诱人、勾魂的九尾狐少女，气声多、语速偏慢」）+ preset_name=新预设名，"
-        "工具会先造音色存预设再合成，不需要你先起语音服务或跑脚本。"
-        "批量时 design_desc/preset_name 只写在顶层一次即可（整批共用这个新音色），"
-        "不要在 items 每一条里重复写——每写一次都会多造一遍音色、极慢。"
-        "**要出多条（≥2）时用一次本工具 + items 或 count**：工具内部会串行一条一条合成完"
-        "（界面上实时显示第几条/真实还是占位），再把全部路径一次回报给你。"
-        "不要为多条台词反复单独调用。items=[{slug,text,voice,kind,note}] 一次最多 24 项；"
-        "count=N 表示同一套参数出 N 条（slug 自动加序号）。"
-        "out 可以给具体文件名（web/audio/cv/me/enter.mp3），也可以给目录（以 / 结尾，"
-        "如 web/audio/cv/me/）——目录形式会按每条 slug 自动落成独立文件，不会互相覆盖。"
-        "**情绪（IndexTTS2）**：只给音色参考音频时模型会用平静语气，台词一多就"
-        "「三句一个调」。想有感情就用：emo_text=情绪描述（如「压抑着怒气的低吼」）；"
-        "或 emo_vector=8 维权重（高兴,愤怒,悲伤,害怕,厌恶,忧郁,惊讶,平静）；"
-        "或 emo_audio=一段带目标情绪的工作区干声路径。三种给其一即可（emo_weight 控强度 0~1）。"
-        "**语速与语言（IndexTTS-2.5）**：speed=语速 0.5~2.0（默认 1.0；>1 更慢更从容，"
-        "<1 更快更急促，用于角色语速差异/强调重点）；lang=语言 zh/en/ja/es/ar"
-        "（默认 auto 由服务端按台词自动判定）。需要读慢一点/快一点时直接传 speed，"
-        "不用在台词里加省略号硬撑停顿。"), "parameters": {
-        "type": "object", "properties": {
-            "text": {**_STR, "description": "要念的台词（kind=voice 时必填；sfx/music 不需要）"},
-            "prompt": {**_STR, "description": "声音描述（kind=sfx/music 时必填，如「清脆的按钮点击声」）"},
-            "voice": _STR, "kind": _STR, "slug": _STR, "count": _INT, "note": _STR,
-            "duration_s": {**_INT, "description": "BGM 时长（秒，默认 30，仅 kind=music）"},
-            "out": {**_STR, "description": "工作区相对输出路径（可选）：给文件名如 web/audio/cv/ur-yx-01/enter.mp3；给目录（以 / 结尾）如 web/audio/cv/me/ 时按每条 slug 自动命名"},
-            "design_desc": {**_STR, "description": "新音色文字描述（要造新音色时用）"},
-            "preset_name": {**_STR, "description": "新音色保存成哪个预设名"},
-            "design_say": {**_STR, "description": "音色设计试音句（可省，默认用 text）"},
-            "design_n": {**_INT, "description": "音色设计候选条数（1-5，默认 1）"},
-            "emo_mode": {**_STR, "description": "情绪模式 0=同参考(平) 1=情感音频 2=八维向量 3=文本描述；一般不用填，给下面素材会自动判定"},
-            "emo_text": {**_STR, "description": "文本描述情绪（如「愤怒地质问」「温柔地哄」）"},
-            "emo_weight": {**_STR, "description": "情绪强度 0~1（默认 0.65）"},
-            "emo_vector": {"type": "array", "description": "8 维情感权重，顺序：高兴,愤怒,悲伤,害怕,厌恶,忧郁,惊讶,平静（每项 0~1，总和≤0.8 效果最好）",
-                           "items": {"type": "number"}},
-            "emo_audio": {**_STR, "description": "情感参考音频（工作区相对路径，一段带目标情绪的干声）"},
-            "speed": {**_STR, "description": "语速 0.5~2.0（默认 1.0；>1 慢 <1 快，IndexTTS-2.5 生效）"},
-            "lang": {**_STR, "description": "语言 zh/en/ja/es/ar（默认 auto 按台词自动判定，2.5 生效）"},
-            "items": {"type": "array", "description": "要合成的音频清单，顺序即合成顺序",
-                      "items": {"type": "object", "properties": {
-                          "slug": _STR, "text": _STR, "voice": _STR, "kind": _STR,
-                          "out": _STR, "design_desc": _STR, "preset_name": _STR,
-                          "emo_mode": _STR, "emo_text": _STR, "emo_vector":
-                              {"type": "array", "items": {"type": "number"}},
-                          "speed": _STR, "lang": _STR,
-                          "note": _STR}}}},
-        # 不能把 text 设成 required：sfx/music 只传 prompt 就该放行（voice 缺 text
-        # 由 generate_audio/_audio_jobs 在业务层报错）。宿主层会先按 schema 校验，
-        # 之前这里留着 required=["text"]，导致 kind=sfx 的调用一律被「缺 text」拦下。
-        "required": []}},
     "report_to_user": {"description": (
         "向用户汇报最终结果（收尾总结）。**这是收尾动作**：调用后本轮执行即结束，"
         "所以只在活确实做完、要交付时调用；待办清单还没做完就别调它"
@@ -423,48 +273,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                             }, "required": ["label"]}},
                 "allow_text": {**_BOOL, "description": "是否允许用户自由输入答案（默认 true）"},
             }, "required": ["question"]}},
-    "edit_image": {"description": "改图（占位模式下不可用，请用 generate_image 重画）",
-                   "parameters": {"type": "object", "properties": {"slug": _STR}}},
-    "save_character_sheet": {"description": "保存角色多视图设定（JSON）", "parameters": {
-        "type": "object", "properties": {"slug": _STR}}},
-    "list_voice_presets": {"description": (
-        "列出语音服务里已保存的音色预设名（给 generate_audio 的 voice 参数用）。"
-        "不确定有哪些音色、或用户说「用之前的音色」时先调这个，"
-        "不要用 dir 去翻语音服务安装目录。"), "parameters": {
-        "type": "object", "properties": {}}},
-    "tts": {"description": "文本转语音（generate_audio 的底层单条实现，优先用 generate_audio）。"
-                           "voice 传音色预设名（IndexTTS2 已创建的预设，一人一嗓），"
-                           "不传用档位默认；out 可指定工作区相对输出路径"
-                           "（如 web/audio/cv/ur-yx-01/enter.mp3，会自动转 24k 单声道 mp3）；"
-                           "情绪可用 emo_text / emo_vector / emo_audio 三种之一；"
-                           "speed=语速 0.5~2.0（>1 慢 <1 快，2.5 生效）；lang=zh/en/ja/es/ar（默认 auto）；"
-                           "无供应商走占位静音", "parameters": {
-        "type": "object", "properties": {"text": _STR, "voice": _STR, "slug": _STR,
-                                         "out": {**_STR, "description": "工作区相对输出路径（可选）"},
-                                         "emo_mode": _STR, "emo_text": _STR,
-                                         "emo_weight": _STR,
-                                         "emo_vector": {"type": "array", "items": {"type": "number"}},
-                                         "emo_audio": _STR,
-                                         "speed": _STR, "lang": _STR}}},
-    "generate_sfx": {"description": "生成音效（内置合成器出真实可听波形，provider=synth；prompt 写声音描述）",
-                     "parameters": {"type": "object", "properties": {
-                         "slug": _STR, "prompt": _STR, "out": _STR, "placeholder": _BOOL}}},
-    "generate_music": {"description": "生成 BGM（内置合成器出真实可听循环片段，provider=synth；prompt 写风格描述）",
-                       "parameters": {"type": "object", "properties": {
-                           "slug": _STR, "prompt": _STR, "duration_s": _INT, "out": _STR,
-                           "placeholder": _BOOL}}},
-    "upsert_voice_profile": {"description": "保存音色档案", "parameters": {
-        "type": "object", "properties": {"slug": _STR}}},
-    "design_voice": {"description": (
-        "按文字描述造一个新音色（VoxCPM2 音色设计），并保存成 IndexTTS2 预设。"
-        "一般用 generate_audio(design_desc=..., preset_name=...) 即可；本工具是底层实现。"
-        "造好后用 tts(voice=预设名) 合成台词。语音服务由工具内部自动拉起，不要自己起服务。"),
-        "parameters": {"type": "object", "properties": {
-            "desc": {**_STR, "description": "音色文字描述（年龄/气质/音色/语速/气声等）"},
-            "name": {**_STR, "description": "保存的预设名（一人一嗓，如「涂山月见·媚」）"},
-            "say": {**_STR, "description": "试音句（可选）"},
-            "n": {**_INT, "description": "候选条数 1-5，默认 1"}},
-            "required": ["desc", "name"]}},
+
 }
 
 TOOL_SPECS: list[ToolSpec] = [

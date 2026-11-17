@@ -31,12 +31,8 @@ if not exist ".env" (
 
 if not defined GA_MODE set GA_MODE=lite
 
-REM Bundled build: seed the demo account on first launch (demo@local / demo1234).
-REM Delete GA_SEED_DEMO from .env to fall back to the /setup bootstrap-token flow.
-set GA_SEED_DEMO=1
-
-REM The server opens the browser only after it is truly ready and the real port is
-REM known (default 18888; auto-shifts if busy or inside a Windows reserved range).
+REM Windows package: data defaults to %USERPROFILE%\.trace-team (SQLite).
+REM First login: admin / 666666 (must be changed on first login).
 set GA_OPEN_BROWSER=1
 
 :menu
@@ -45,7 +41,7 @@ echo ============================================
 echo   Trace
 echo ============================================
 echo   [1] Start server      default, http://127.0.0.1:18888/
-echo   [2] Reset a password  forgot your login
+echo   [2] Reset admin password  forgot your login
 echo   [Q] Quit
 echo ============================================
 set "SEL="
@@ -70,6 +66,7 @@ goto menu
 :run
 echo ============================================
 echo   Starting Trace ...
+echo   First login: admin / 666666  (must change it on first login)
 echo   Default http://127.0.0.1:18888/  opens automatically once ready
 echo   If 18888 is busy it auto-shifts; the real port is in the log below.
 echo   To stop: double-click stop.cmd  or press Ctrl+C here.

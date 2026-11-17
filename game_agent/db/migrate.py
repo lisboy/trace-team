@@ -11,7 +11,7 @@ from pathlib import Path
 
 from sqlalchemy import select, text
 
-from game_agent.config import DATABASE_URL
+from game_agent.config import DATABASE_URL, is_sqlite
 from game_agent.db.models import Base
 from game_agent.db.session import engine
 from game_agent.logging_setup import get_logger
@@ -24,6 +24,7 @@ async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     await _ensure_columns()
+    await _widen_llm_transcript_text()
     # 轻量版本记录（Alembic 未启用时的兼容位）
     async with engine.begin() as conn:
         try:
@@ -37,6 +38,28 @@ async def init_db() -> None:
             pass
     log.info("database initialized", extra={"url": _mask(DATABASE_URL)})
     await _migrate_chat_images()
+
+
+async def _widen_llm_transcript_text() -> None:
+    """MySQL 上把 llm_transcripts 的大字段从 TEXT 放宽到 LONGTEXT。
+
+    历史建库时这两列按 TEXT 建（SQLite 没长度上限，问题只在 MySQL 暴露）：一轮上下文
+    稍大（中文 3 字节/字，两万字就到 64KB）落库就报
+    ``1406 Data too long for column 'request_json'``，聊天记录里每轮都刷一遍
+    「record_llm_transcript failed」。新库由 models 的方言变体直接建成 LONGTEXT，
+    老库在这里原地放宽；SQLite 跳过（TEXT 本身无上限）。幂等：已是 LONGTEXT 时
+    MODIFY 同样成功。
+    """
+    if is_sqlite():
+        return
+    for col in ("request_json", "response_json"):
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text(
+                    f"ALTER TABLE llm_transcripts MODIFY COLUMN {col} LONGTEXT NOT NULL"))
+            log.info("migrated: llm_transcripts.%s -> LONGTEXT", col)
+        except Exception:  # noqa: BLE001 - 放宽失败不能挡住启动
+            log.exception("llm_transcripts.%s 放宽到 LONGTEXT 失败（忽略）", col)
 
 
 async def _migrate_chat_images() -> None:
@@ -153,7 +176,7 @@ async def _ensure_columns() -> None:
         # 历史列：git 接管已下线，运行时不再读取，保留只为避免破坏性迁移
         ("projects", "ALTER TABLE projects ADD COLUMN git_enabled BOOLEAN "
                      "NOT NULL DEFAULT FALSE"),
-        # 媒体档位：model_profiles.kind 区分对话/图像/音频模型档位（存量档位都是 llm）
+        # 档位类型列（历史：区分对话/图像/音频；媒体生成已移除，只保留 llm 使用）
         ("model_profiles", "ALTER TABLE model_profiles ADD COLUMN kind VARCHAR(10) "
                            "NOT NULL DEFAULT 'llm'"),
         # 计划机制：runs.plan_json 存组长维护的待办清单（存量行留 NULL，读取时按 [] 处理）
@@ -180,7 +203,7 @@ async def _ensure_columns() -> None:
         ("project_memories", "ALTER TABLE project_memories ADD COLUMN tags VARCHAR(240) NULL"),
         ("project_memories", "ALTER TABLE project_memories ADD COLUMN session_id CHAR(32) NULL"),
         ("project_memories", "ALTER TABLE project_memories ADD COLUMN updated_at DATETIME NULL"),
-        # 运行能力开关（自动化测试/联网/媒体）：默认 {} = 全开
+        # 运行能力开关（自动化测试/联网）：默认 {} = 全开
         ("runs", "ALTER TABLE runs ADD COLUMN options_json JSON"),
         # 会话权限作用域：workspace=仅工作区（默认，安全边界）/ full=全部权限
         ("sessions", "ALTER TABLE sessions ADD COLUMN permission_scope VARCHAR(16) "
@@ -195,6 +218,26 @@ async def _ensure_columns() -> None:
         # 该 task 自己的取消看门狗看到就掐断它（不影响主agent / 其它子agent）。
         ("tasks", "ALTER TABLE tasks ADD COLUMN cancel_requested BOOLEAN "
                   "NOT NULL DEFAULT FALSE"),
+        # 团队版：登录名（唯一）与「首次登录必须改密」
+        ("users", "ALTER TABLE users ADD COLUMN username VARCHAR(60) NULL"),
+        ("users", "ALTER TABLE users ADD COLUMN must_change_password BOOLEAN "
+                  "NOT NULL DEFAULT 0"),
+        # 团队版：项目绑定模型档位（管理员配置，对话强制使用）
+        ("projects", "ALTER TABLE projects ADD COLUMN model_profile_key VARCHAR(40) NULL"),
+        # 团队版：项目级并发上限（0=不限；超出的 run 留在队列里等）
+        ("projects", "ALTER TABLE projects ADD COLUMN max_concurrency INTEGER "
+                     "NOT NULL DEFAULT 0"),
+        # 团队版：项目级仓库绑定（对话前同步远端最新内容）
+        ("projects", "ALTER TABLE projects ADD COLUMN vcs_type VARCHAR(8) "
+                     "NOT NULL DEFAULT 'none'"),
+        ("projects", "ALTER TABLE projects ADD COLUMN vcs_remote TEXT NULL"),
+        ("projects", "ALTER TABLE projects ADD COLUMN vcs_username VARCHAR(160) NULL"),
+        ("projects", "ALTER TABLE projects ADD COLUMN vcs_secret TEXT NULL"),
+        # 团队版：消息通道绑定到项目（空 = 团队级/历史绑定，仅作回退）
+        ("channel_links", "ALTER TABLE channel_links ADD COLUMN project_id CHAR(32) NULL"),
+        # 团队版：模型档位 / 智能体按项目维度（空 = 团队默认，项目行优先）
+        ("model_profiles", "ALTER TABLE model_profiles ADD COLUMN project_id CHAR(32) NULL"),
+        ("agents", "ALTER TABLE agents ADD COLUMN project_id CHAR(32) NULL"),
     ]
     for table, ddl in stmts:
         try:
@@ -202,6 +245,29 @@ async def _ensure_columns() -> None:
                 await conn.execute(text(ddl))
             log.info("migrated: %s", table)
         except Exception:  # noqa: BLE001 - 列已存在等情况
+            pass
+    # username 的唯一索引单独建：MySQL 的 ADD COLUMN 与 ADD UNIQUE 分两条更稳
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text(
+                "CREATE UNIQUE INDEX uq_users_username ON users (username)"))
+    except Exception:  # noqa: BLE001 - 已存在
+        pass
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text(
+                "CREATE INDEX ix_channel_links_project ON channel_links (project_id)"))
+    except Exception:  # noqa: BLE001 - 已存在
+        pass
+    for ddl in (
+        "CREATE INDEX ix_agents_team_project_key ON agents (team_id, project_id, `key`)",
+        "CREATE INDEX ix_model_profiles_team_project_key "
+        "ON model_profiles (team_id, project_id, `key`)",
+    ):
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text(ddl))
+        except Exception:  # noqa: BLE001 - 已存在
             pass
     await _relax_artifacts_run_id()
     await _dedupe_auto_memories()
@@ -216,6 +282,21 @@ async def _ensure_columns() -> None:
     await _sweep_transcripts()
     await _backfill_llm_providers()
     await _backfill_llm_call_purpose()
+    await _force_workspace_scope()
+
+
+async def _force_workspace_scope() -> None:
+    """团队版助手行为固定「仅工作区」：历史会话存过的 full 一律归位。
+
+    后续写入也由接口/编排器强制 workspace，这里只管升级前留下的存量。
+    """
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text(
+                "UPDATE sessions SET permission_scope='workspace' "
+                "WHERE permission_scope IS NULL OR permission_scope <> 'workspace'"))
+    except Exception:  # noqa: BLE001 - 归位失败不影响启动
+        pass
 
 
 async def _backfill_llm_call_purpose() -> None:
@@ -356,7 +437,10 @@ async def _relax_artifacts_run_id() -> None:
     """artifacts.run_id 需可空（素材导入/外置拉取不关联 run）。
 
     SQLite 不能直接改列约束，走「建新表 → 拷贝 → 换名」重建。
+    MySQL 新建库时 create_all 已经是可空列，不需要这段；老 MySQL 库也不做破坏性重建。
     """
+    if not is_sqlite():
+        return
     async with engine.begin() as conn:
         rows = (await conn.execute(
             text("PRAGMA table_info(artifacts)"))).mappings().all()
@@ -412,10 +496,19 @@ async def _fix_event_seq() -> None:
                         "UPDATE events SET seq = :seq WHERE id = :eid"),
                         {"seq": i, "eid": eid})
                 log.info("events seq renumbered for project %s (%d rows)", pid, len(ids))
-            # 建唯一索引（幂等）
-            await conn.execute(text(
-                "CREATE UNIQUE INDEX IF NOT EXISTS uq_events_project_seq "
-                "ON events (project_id, seq)"))
+            # 建唯一索引（幂等）。MySQL 不支持 CREATE INDEX IF NOT EXISTS，
+            # 已存在时抛错即可（外层 except 会接住，不影响启动）。
+            if is_sqlite():
+                await conn.execute(text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_events_project_seq "
+                    "ON events (project_id, seq)"))
+            else:
+                try:
+                    await conn.execute(text(
+                        "CREATE UNIQUE INDEX uq_events_project_seq "
+                        "ON events (project_id, seq)"))
+                except Exception:  # noqa: BLE001 - 索引已存在
+                    pass
         if dups:
             log.info("migrated: events seq deduped (%d projects)", len(dups))
     except Exception:  # noqa: BLE001
@@ -442,7 +535,7 @@ async def _deround_role_prompts() -> None:
                 res = await conn.execute(
                     text("UPDATE agents SET system_prompt = "
                          "REPLACE(system_prompt, :old, :new) "
-                         "WHERE system_prompt LIKE :like"),
+                         "WHERE project_id IS NULL AND system_prompt LIKE :like"),
                     {"old": old, "new": new, "like": f"%{old[:24]}%"})
                 n += res.rowcount or 0
         if n:
@@ -470,7 +563,8 @@ async def _refresh_role_prompts() -> None:
             for mark in stale_marks:
                 res = await conn.execute(text(
                     "UPDATE agents SET system_prompt = :np "
-                    "WHERE `key` = 'main' AND system_prompt LIKE :m"),
+                    "WHERE `key` = 'main' AND project_id IS NULL "
+                    "AND system_prompt LIKE :m"),
                     {"np": newp, "k": mark, "m": f"%{mark}%"})
                 if res.rowcount:
                     log.info("migrated: main prompt refreshed (removed stale ref %s, %d rows)",
@@ -487,7 +581,8 @@ async def _refresh_role_prompts() -> None:
             # v3 提示词迭代（环境信息去重 / 占位模式前置 / 二·五压缩成硬规则）：
             # 只刷新带旧版指纹的行（旧默认提示词里的事故叙事），管理员自定义的不动。
             res = await conn.execute(text(
-                "UPDATE agents SET system_prompt = :np WHERE `key` = 'main' AND "
+                "UPDATE agents SET system_prompt = :np WHERE `key` = 'main' "
+                "AND project_id IS NULL AND "
                 "(system_prompt LIKE '%49 分钟、348 次工具调用%' "
                 "OR system_prompt LIKE '%先改后证」纪律（2026-10-28 实测教训）%' "
                 "OR (system_prompt LIKE '%配音只有一个入口%' "
@@ -511,7 +606,8 @@ async def _refresh_role_prompts() -> None:
             if _new_tail:
                 res = await conn.execute(text(
                     "UPDATE agents SET system_prompt = REPLACE(system_prompt, :old, :new) "
-                    "WHERE `key` = 'main' AND system_prompt LIKE :pat"),
+                    "WHERE `key` = 'main' AND project_id IS NULL "
+                    "AND system_prompt LIKE :pat"),
                     {"old": _old_tail, "new": _new_tail, "pat": "%五段式，简明%"})
                 if res.rowcount:
                     log.info("migrated: main 汇报第九节升级为含原因/说明/风险点 (%d rows)",
@@ -535,44 +631,13 @@ async def _refresh_role_prompts() -> None:
             for _gap in ("", "\n"):
                 res = await conn.execute(text(
                     "UPDATE agents SET system_prompt = REPLACE(system_prompt, :old, :new) "
-                    "WHERE `key` = 'main' AND system_prompt LIKE :pat"),
+                    "WHERE `key` = 'main' AND project_id IS NULL "
+                    "AND system_prompt LIKE :pat"),
                     {"old": _h9 + _gap + _first,
                      "new": _h9 + "\n" + _ins + "\n" + _first,
                      "pat": "%═══ 九、汇报（report_to_user，收尾总结必须写清%"})
                 if res.rowcount:
                     log.info("migrated: main 新增「中途同步进度」口径 (%d rows)", res.rowcount)
-            # v3.2 数据修复：把团队唯一的音频/图像档位自动补绑到 main 的 params_json
-            # （角色合并时旧行里本来就没有 *_profile 字段 → 档位明明配了，
-            # generate_audio/generate_image 却解析不到、静默走占位）。
-            # 管理员已显式绑定的不动；该 kind 有多个档位时不猜，留给用户绑。
-            # 用「先读后写」的 Python 循环而不是 UPDATE...JOIN：
-            # `UPDATE agents a SET a.col=...` 这种带表别名的写法在 SQLite 上是语法错误
-            # （打包版首启即报 near "a"，2026-10-30 实测），Python 侧处理最稳。
-            # ⚠️ params_json 可能存的是 JSON 文档 `null`（不是 SQL NULL），所以解析后
-            # 非 dict 一律当空对象，再 JSON_SET 回写。
-            for kind in ("audio", "image"):
-                rows = (await conn.execute(text(
-                    "SELECT a.id, a.params_json, "
-                    "(SELECT COUNT(*) FROM model_profiles p2 "
-                    " WHERE p2.team_id = a.team_id AND p2.kind = :kind) AS cnt, "
-                    "(SELECT p.`key` FROM model_profiles p "
-                    " WHERE p.team_id = a.team_id AND p.kind = :kind LIMIT 1) AS pk "
-                    "FROM agents a WHERE a.`key` = 'main'"), {"kind": kind})).all()
-                for rid, pj, cnt, pk in rows:
-                    if isinstance(pj, str):
-                        try:
-                            pj = json.loads(pj)
-                        except ValueError:
-                            pj = None
-                    pj = pj if isinstance(pj, dict) else {}
-                    if pj.get(f"{kind}_profile") is not None or cnt != 1 or not pk:
-                        continue
-                    pj[f"{kind}_profile"] = pk
-                    await conn.execute(
-                        text("UPDATE agents SET params_json = :pj WHERE id = :rid"),
-                        {"pj": json.dumps(pj, ensure_ascii=False), "rid": rid})
-                    log.info("migrated: main %s_profile auto-bound (unique %s profile)",
-                             kind, kind)
             # 出厂提示词的后续迭代此前只活在代码里：seed_default_agents 建行之后再也不碰，
             # 于是「一次问全 / 先取数字再截图 / 入口只撞一次」这几条改完几天都没上线
             # （2026-10-29 实测：库里的 main 提示词还停在加这三条之前的版本）。
@@ -580,7 +645,8 @@ async def _refresh_role_prompts() -> None:
             # = 只是版本落后的出厂词，升级；有任何一行当前默认里没有 = 管理员改过，不动。
             up = 0
             res = await conn.execute(text(
-                "SELECT team_id, system_prompt, params_json FROM agents WHERE `key` = 'main'"))
+                "SELECT team_id, system_prompt, params_json FROM agents "
+                "WHERE `key` = 'main' AND project_id IS NULL"))
             for team_id, sp, pj in res.all():
                 if not sp or sp == newp:
                     continue
@@ -597,7 +663,8 @@ async def _refresh_role_prompts() -> None:
                     continue
                 await conn.execute(text(
                     "UPDATE agents SET system_prompt = :np "
-                    "WHERE `key` = 'main' AND team_id = :t"), {"np": newp, "t": team_id})
+                    "WHERE `key` = 'main' AND project_id IS NULL AND team_id = :t"),
+                    {"np": newp, "t": team_id})
                 up += 1
             if up:
                 log.info("migrated: main prompt upgraded to current default (%d rows)", up)
@@ -610,7 +677,8 @@ async def _refresh_role_prompts() -> None:
                          "要视频（动态素材/过场动画")
             if "generate_video" in newp and "看完必须把判断写成文件" in newp:
                 res = await conn.execute(text(
-                    "SELECT team_id, system_prompt, params_json FROM agents WHERE `key` = 'main'"))
+                    "SELECT team_id, system_prompt, params_json FROM agents "
+                "WHERE `key` = 'main' AND project_id IS NULL"))
                 up2 = 0
                 for team_id, sp, pj in res.all():
                     sp = sp or ""
@@ -632,7 +700,8 @@ async def _refresh_role_prompts() -> None:
                         continue
                     await conn.execute(text(
                         "UPDATE agents SET system_prompt = :np "
-                        "WHERE `key` = 'main' AND team_id = :t"), {"np": newp, "t": team_id})
+                        "WHERE `key` = 'main' AND project_id IS NULL AND team_id = :t"),
+                        {"np": newp, "t": team_id})
                     up2 += 1
                 if up2:
                     log.info("migrated: main prompt upgraded to v3.3 (video tool + art-review note, %d rows)",
@@ -642,7 +711,8 @@ async def _refresh_role_prompts() -> None:
             # （旧内容能在新默认里全找到）的团队才升级；管理员自定义的行匹配不上，保持不动。
             if "八方画像" in newp and "views=\"all\"" in newp:
                 res = await conn.execute(text(
-                    "SELECT team_id, system_prompt, params_json FROM agents WHERE `key` = 'main'"))
+                    "SELECT team_id, system_prompt, params_json FROM agents "
+                "WHERE `key` = 'main' AND project_id IS NULL"))
                 up3 = 0
                 for team_id, sp, pj in res.all():
                     sp = sp or ""
@@ -660,7 +730,8 @@ async def _refresh_role_prompts() -> None:
                         continue
                     await conn.execute(text(
                         "UPDATE agents SET system_prompt = :np "
-                        "WHERE `key` = 'main' AND team_id = :t"), {"np": newp, "t": team_id})
+                        "WHERE `key` = 'main' AND project_id IS NULL AND team_id = :t"),
+                        {"np": newp, "t": team_id})
                     up3 += 1
                 if up3:
                     log.info("migrated: main prompt upgraded to v3.4 (multi-view views + negative_prompt, %d rows)",
@@ -673,7 +744,8 @@ async def _refresh_role_prompts() -> None:
                 _pairs = _v35_prompt_pairs()
                 if _pairs:
                     res = await conn.execute(text(
-                        "SELECT team_id, system_prompt FROM agents WHERE `key` = 'main'"))
+                        "SELECT team_id, system_prompt FROM agents "
+                        "WHERE `key` = 'main' AND project_id IS NULL"))
                     up4 = 0
                     for team_id, sp in res.all():
                         cur = sp or ""
@@ -685,11 +757,58 @@ async def _refresh_role_prompts() -> None:
                             continue  # 那几段被管理员改过 / 版本更老 → 整行不动
                         await conn.execute(text(
                             "UPDATE agents SET system_prompt = :np "
-                            "WHERE `key` = 'main' AND team_id = :t"), {"np": cur, "t": team_id})
+                            "WHERE `key` = 'main' AND project_id IS NULL AND team_id = :t"),
+                            {"np": cur, "t": team_id})
                         up4 += 1
                     if up4:
                         log.info("migrated: main prompt upgraded to v3.5 (service start is opt-in, %d rows)",
                                  up4)
+            # 2026-11-17：团队版移除图片/音频/视频生成。存量出厂提示词里仍写着
+            # generate_image / generate_audio / generate_video，模型会去调已删除的工具。
+            # 只刷新「没被管理员在设置里保存过」的行（保存自定义正文会写 prompt_custom=true）。
+            res = await conn.execute(text(
+                "SELECT team_id, system_prompt, params_json FROM agents "
+                "WHERE `key` = 'main' AND project_id IS NULL"))
+            up_media = 0
+            for team_id, sp, pj in res.all():
+                sp = sp or ""
+                if not sp or sp == newp:
+                    continue
+                if not any(m in sp for m in ("generate_image", "generate_audio",
+                                             "generate_video", "list_voice_presets")):
+                    continue
+                if isinstance(pj, str):
+                    try:
+                        pj = json.loads(pj)
+                    except ValueError:
+                        pj = None
+                if (pj or {}).get("prompt_custom") is True:
+                    continue
+                await conn.execute(text(
+                    "UPDATE agents SET system_prompt = :np "
+                    "WHERE `key` = 'main' AND project_id IS NULL AND team_id = :t"),
+                    {"np": newp, "t": team_id})
+                up_media += 1
+            if up_media:
+                log.info("migrated: main prompt refreshed (media tools removed, %d rows)", up_media)
+            # 媒体档位绑定（image_profile / audio_profile）已无意义：从 params_json 里清掉，
+            # 避免设置页/检查逻辑还把它们当成有效绑定。
+            rows = (await conn.execute(text("SELECT id, params_json FROM agents"))).all()
+            for rid, pj in rows:
+                if isinstance(pj, str):
+                    try:
+                        pj = json.loads(pj)
+                    except ValueError:
+                        continue
+                if not isinstance(pj, dict):
+                    continue
+                touched = [k for k in ("image_profile", "audio_profile") if k in pj]
+                for k in touched:
+                    pj.pop(k, None)
+                if touched:
+                    await conn.execute(
+                        text("UPDATE agents SET params_json = :pj WHERE id = :rid"),
+                        {"pj": json.dumps(pj, ensure_ascii=False), "rid": rid})
     except Exception:  # noqa: BLE001
         log.exception("角色提示词 v3 迁移失败（忽略）")
 
@@ -720,7 +839,8 @@ async def _migrate_sub_report_prompt() -> None:
     try:
         async with engine.begin() as conn:
             res = await conn.execute(text(
-                "SELECT team_id, system_prompt, params_json FROM agents WHERE `key` = 'sub'"))
+                "SELECT team_id, system_prompt, params_json FROM agents "
+                "WHERE `key` = 'sub' AND project_id IS NULL"))
             up = 0
             for team_id, sp, pj in res.all():
                 if not sp or sp == new:
@@ -737,7 +857,8 @@ async def _migrate_sub_report_prompt() -> None:
                     continue
                 await conn.execute(text(
                     "UPDATE agents SET system_prompt = :np "
-                    "WHERE `key` = 'sub' AND team_id = :t"), {"np": new, "t": team_id})
+                    "WHERE `key` = 'sub' AND project_id IS NULL AND team_id = :t"),
+                    {"np": new, "t": team_id})
                 up += 1
             if up:
                 log.info("migrated: sub prompt upgraded to require report_to_user (%d rows)", up)
@@ -777,7 +898,8 @@ async def _migrate_no_stop_wording() -> None:
             for old, new in pairs:
                 res = await conn.execute(text(
                     "UPDATE agents SET system_prompt = REPLACE(system_prompt, :old, :new) "
-                    "WHERE `key` = 'main' AND system_prompt LIKE :pat"),
+                    "WHERE `key` = 'main' AND project_id IS NULL "
+                    "AND system_prompt LIKE :pat"),
                     {"old": old, "new": new, "pat": "%" + old.splitlines()[0][:24] + "%"})
                 if res.rowcount:
                     log.info("migrated: removed stop-wording in main prompt (%d rows)", res.rowcount)
@@ -800,7 +922,7 @@ async def _migrate_diagnose_tools_unrestricted() -> None:
         async with engine.begin() as conn:
             res = await conn.execute(text(
                 "UPDATE agents SET system_prompt = REPLACE(system_prompt, :old, :new) "
-                "WHERE `key` = 'main' AND system_prompt LIKE :pat"),
+                "WHERE `key` = 'main' AND project_id IS NULL AND system_prompt LIKE :pat"),
                 {"old": old, "new": new, "pat": "%写工具会被剔除%"})
             if res.rowcount:
                 log.info("migrated: diagnose prompt tools unrestricted (%d rows)", res.rowcount)
@@ -835,7 +957,7 @@ async def _migrate_spawn_min_items() -> None:
         async with engine.begin() as conn:
             res = await conn.execute(text(
                 "UPDATE agents SET system_prompt = REPLACE(system_prompt, :old, :new) "
-                "WHERE `key` = 'main' AND system_prompt LIKE :pat"),
+                "WHERE `key` = 'main' AND project_id IS NULL AND system_prompt LIKE :pat"),
                 {"old": old_p, "new": new_p, "pat": "%三处以上独立线索用 spawn_agents%"})
             if res.rowcount:
                 log.info("migrated: main prompt spawn 门槛 3→2 (%d rows)", res.rowcount)
@@ -994,10 +1116,8 @@ async def _collapse_agent_roles() -> None:
 
     每个团队：若还没有 main 行，则
       - model_profile_key ← planner 行的（会话模型）；
-      - params_json.image_profile ← artist 行的（美术模型）；
-      - params_json.audio_profile ← voice 行的（配音模型）；
-      - system_prompt ← planner 的旧提示词，若为空或还引用 dispatch_* 派发体系
-        则直接用 v3 默认 main 提示词（派发工具已删除，旧提示词只会误导）。
+      - system_prompt ← planner 的旧提示词，若为空或还引用已删除的派发/媒体工具
+        则直接用 v3 默认 main 提示词（那些工具已删除，旧提示词只会误导）。
     然后删除三个旧角色行（幂等：再跑一遍时旧行已不存在）。
     """
     import json as _json
@@ -1011,7 +1131,8 @@ async def _collapse_agent_roles() -> None:
     default_prompt = ROLE_PROMPTS.get("main") or ""
     try:
         async with SessionLocal() as s:
-            rows = (await s.execute(select(Agent))).scalars().all()
+            # 早期三角色行都是团队级的：项目覆盖（project_id 非空）是新机制，不参与合并
+            rows = (await s.execute(select(Agent).where(Agent.project_id.is_(None)))).scalars().all()
             by_team: dict[str, list] = {}
             for r in rows:
                 by_team.setdefault(r.team_id, []).append(r)
@@ -1023,30 +1144,16 @@ async def _collapse_agent_roles() -> None:
                 main = by_key.get("main")
                 if main is None:
                     planner = by_key.get("planner")
-                    artist = by_key.get("artist")
-                    voice = by_key.get("voice")
                     params: dict = {}
                     try:
                         if planner and planner.params_json:
                             params = dict(_json.loads(planner.params_json))
                     except Exception:  # noqa: BLE001
                         params = {}
-                    try:
-                        if artist and artist.params_json:
-                            ip = (_json.loads(artist.params_json) or {}).get("image_profile")
-                            if ip:
-                                params["image_profile"] = ip
-                    except Exception:  # noqa: BLE001
-                        pass
-                    try:
-                        if voice and voice.params_json:
-                            ap = (_json.loads(voice.params_json) or {}).get("audio_profile")
-                            if ap:
-                                params["audio_profile"] = ap
-                    except Exception:  # noqa: BLE001
-                        pass
                     old_prompt = (planner.system_prompt if planner else "") or ""
-                    if ("dispatch_art" in old_prompt or "dispatch_audio" in old_prompt
+                    if (any(m in old_prompt for m in (
+                            "dispatch_art", "dispatch_audio", "generate_image",
+                            "generate_audio", "generate_video"))
                             or not old_prompt.strip()):
                         old_prompt = default_prompt
                     main = Agent(

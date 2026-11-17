@@ -10,7 +10,7 @@ set "PIDFILE="
 if defined GA_DATA_DIR (
   set "PIDFILE=%GA_DATA_DIR%\game_agent.pid"
 ) else (
-  set "PIDFILE=%USERPROFILE%\.trace\game_agent.pid"
+  set "PIDFILE=%USERPROFILE%\.trace-team\game_agent.pid"
 )
 
 if exist "%PIDFILE%" (

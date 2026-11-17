@@ -1,11 +1,11 @@
 """解析「团队 main 角色绑定的对话档位」→ Ctx.model_profile，供工作台类的
 纯文本辅助功能（提示词增强/补全、文案润色）复用。
 
-为什么需要它：这些功能以前直接 ``build_llm("main")``（不传 ctx），会回退到 .env
-全局端点；而全局订阅常已失效（403 SUBSCRIPTION_NOT_FOUND），只有聊天能用是因为
-它走的是团队绑定的档位。这里把 project_memory._main_profile 的取值链路抽出来公用：
+为什么需要它：这些功能以前直接 ``build_llm("main")``（不传 ctx），会去读环境变量
+端点（该订阅已失效时永远 403）。团队版没有 .env 全局兜底，模型只能来自绑定档位。
+这里把 project_memory._main_profile 的取值链路抽出来公用：
 Agent.model_profile_key → ModelProfile →（provider_id）供应商 base_url/api_key
-（档位 inline 优先）。拿不到就返回 {}，调用方再让 build_llm 回退全局默认。
+（档位 inline 优先）。拿不到就返回 {}，调用方跳过这项辅助功能。
 """
 from __future__ import annotations
 

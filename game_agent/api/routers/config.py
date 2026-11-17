@@ -14,21 +14,21 @@ from datetime import datetime, timedelta, timezone
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import delete, func, or_, select, text
 
 from game_agent.config import LLM_USER_AGENT
 from game_agent.llm.openai_compat import (
     _new_llm_client, _proxy_env_disabled, _system_proxy,
 )
-from game_agent.api.deps import require
+from game_agent.api.deps import is_admin_role, require, require_admin
 from game_agent.auth.rbac import (
-    PERM_AGENT_CONFIG, PERM_USAGE_VIEW, PERM_VIEW,
+    PERM_AGENT_CONFIG, PERM_VIEW,
 )
 from game_agent.core.context import RequestContext
 from game_agent.agents.roles import ROLE_PROMPTS, ROLE_TOOLS
 from game_agent.llm.context_window import DEFAULT_CONTEXT_WINDOW
 from game_agent.db.models import (
-    Agent, AuditLog, LlmCall, LlmProvider, ModelProfile, Project, Run,
+    Agent, AuditLog, LlmCall, LlmProvider, ModelProfile, Project,
     Session, UsageLedger, User,
 )
 from game_agent.db.session import SessionLocal
@@ -108,16 +108,19 @@ _WAF_HINT_TPL = (
 
 def _looks_like_waf(status: int, content_type: str, cf_mitigated: str | None,
                     text: str) -> bool:
-    if status not in (403, 429, 503):
+    if status not in (200, 403, 429, 503):
         return False
     if (cf_mitigated or "").lower() == "challenge":
         return True
     if "html" not in (content_type or "").lower():
         return False
     low = (text or "")[:800].lower()
-    return ("just a moment" in low or "cf-chl" in low
-            or "challenge-platform" in low
-            or "<!doctype html" in low or "<html" in low)
+    if ("just a moment" in low or "cf-chl" in low
+            or "challenge-platform" in low):
+        return True
+    # 200 + 普通 HTML 不算挑战（地址指向控制台/登录页也会这样），
+    # 只有非 2xx 的整页 HTML 才按人机验证拦截处理。
+    return status in (403, 429, 503) and ("<!doctype html" in low or "<html" in low)
 
 
 def _is_waf_challenge(r: httpx.Response) -> bool:
@@ -142,7 +145,8 @@ async def _with_waf_retry(factory, attempts: int = 3, delays=(0.6, 1.6)):
 
 
 @router.post("/llm/models")
-async def list_llm_models(body: LlmModelsIn, ctx: RequestContext = Depends(require(PERM_VIEW))):
+async def list_llm_models(body: LlmModelsIn,
+                          ctx: RequestContext = Depends(require_admin())):
     """代理拉取模型列表（服务端发起，避开浏览器 CORS 与 key 泄露）。
 
     地址容错：先试 {base}/models、再试 {base}/v1/models；鉴权先 Bearer，遇 401/403 再试
@@ -189,6 +193,7 @@ async def list_llm_models(body: LlmModelsIn, ctx: RequestContext = Depends(requi
         p_used = ""
         p_waf = False
         p_conn = 0
+        p_nonjson = False
         p_status: dict[int, str] = {}
         for url in _model_url_candidates(base):
             if p_ids:
@@ -216,7 +221,11 @@ async def list_llm_models(body: LlmModelsIn, ctx: RequestContext = Depends(requi
                 try:
                     data = r.json()
                 except Exception:  # noqa: BLE001
-                    p_attempts.append(f"· {url}（{auth}）→ HTTP 200 但不是 JSON（{ct or '未知类型'}）")
+                    p_nonjson = True
+                    snippet = (r.text or "")[:120].replace("\n", " ").strip()
+                    via = f"（被重定向到 {r.url}）" if r.history and str(r.url) != url else ""
+                    p_attempts.append(f"· {url}（{auth}）→ HTTP 200 但不是 JSON（{ct or '未知类型'}）"
+                                      f"{via}：{snippet}")
                     break
                 got = _extract_model_ids(data if isinstance(data, dict) else {})
                 if not got:
@@ -225,7 +234,8 @@ async def list_llm_models(body: LlmModelsIn, ctx: RequestContext = Depends(requi
                 p_ids, p_used = got, url
                 break
         return {"attempts": p_attempts, "ids": p_ids, "used_url": p_used,
-                "saw_waf": p_waf, "conn_fail": p_conn, "statuses": p_status}
+                "saw_waf": p_waf, "conn_fail": p_conn, "nonjson": p_nonjson,
+                "statuses": p_status}
 
     # 代理自动模式（与真实对话一致）：系统配了代理先走代理，连不上自动改直连再试；
     # 没配代理就直接直连。只连不通（纯连接失败、拿不到任何 HTTP 响应）才降级，
@@ -233,12 +243,18 @@ async def list_llm_models(body: LlmModelsIn, ctx: RequestContext = Depends(requi
     proxy = None if _proxy_env_disabled() else await asyncio.to_thread(_system_proxy)
     async with _new_llm_client(proxy, ua, timeout=15, follow_redirects=True) as client:
         res = await _probe(client)
-    # 代理出口被 CF 判成人机验证时，代理的出口 IP 才是问题根源——改直连往往直接 200。
-    if proxy and not res["ids"] and (res["saw_waf"] or (res["conn_fail"] and not res["statuses"])):
+    # 代理出口被 CF 判成人机验证、或代理直接回了 HTML 提示页时，改直连往往就正常。
+    if proxy and not res["ids"] and (res["saw_waf"] or res["nonjson"]
+                                     or (res["conn_fail"] and not res["statuses"])):
         async with _new_llm_client(None, ua, timeout=15, follow_redirects=True) as client:
             res2 = await _probe(client)
         if res2["ids"] or res2["statuses"]:
-            why = "被人机验证拦截" if res["saw_waf"] else "连不上"
+            if res["saw_waf"]:
+                why = "被人机验证拦截"
+            elif res["nonjson"]:
+                why = "返回的不是 API 数据"
+            else:
+                why = "连不上"
             res2["attempts"].insert(0, f"· 经系统代理 {proxy} {why}，已自动改直连重试")
         res = res2
     attempts = res["attempts"]
@@ -246,6 +262,7 @@ async def list_llm_models(body: LlmModelsIn, ctx: RequestContext = Depends(requi
     used_url = res["used_url"]
     saw_waf = res["saw_waf"]
     conn_fail = res["conn_fail"]
+    nonjson = res["nonjson"]
     statuses = res["statuses"]
 
     if not ids:
@@ -262,6 +279,11 @@ async def list_llm_models(body: LlmModelsIn, ctx: RequestContext = Depends(requi
         elif 403 in statuses:
             hint = ("服务器认得请求但拒绝了这个账户（常见于订阅过期 / 分组的 Key 无 /models 权限）。"
                     "可先「+ 添加模型」手填模型名直接保存，或在厂商后台确认套餐与分组。")
+        elif nonjson:
+            hint = ("返回的是网页（HTML）而不是 API 数据：多半是地址指向了控制台/登录页、"
+                    "http 被网关重定向到网页，或者中间代理插了提示页。"
+                    "请核对地址（多数是 https:// 且以 /v1 结尾，可从别的能拉取的机器对照），"
+                    "也可以直接「+ 添加模型」手填模型名保存，不影响对话使用。")
         else:
             hint = ("确认 Base URL 是接口地址（一般以 /v1 结尾，可访问 /v1/models）；"
                     "也可以先「+ 添加模型」手填模型名直接保存，不影响对话使用。")
@@ -296,7 +318,8 @@ class LlmSpeedTestIn(BaseModel):
 
 
 @router.post("/llm/speed-test")
-async def speed_test_llm_models(body: LlmSpeedTestIn, ctx: RequestContext = Depends(require(PERM_VIEW))):
+async def speed_test_llm_models(body: LlmSpeedTestIn,
+                                ctx: RequestContext = Depends(require_admin())):
     """一键测速：给目录里的每个模型发一条短请求，按 产出tokens/耗时 算 t/s。
 
     与真实对话同一条网络路径（同 UA、同系统代理自动降级）。计时是端到端的
@@ -538,7 +561,7 @@ def _provider_out(p: LlmProvider, bound: int = 0) -> dict:
 
 
 @router.get("/llm-providers")
-async def list_llm_providers(ctx: RequestContext = Depends(require(PERM_VIEW))):
+async def list_llm_providers(ctx: RequestContext = Depends(require_admin())):
     async with SessionLocal() as s:
         rows = (await s.execute(select(LlmProvider).where(
             LlmProvider.team_id == _u(ctx.team_id)).order_by(LlmProvider.created_at)
@@ -689,13 +712,15 @@ async def delete_llm_provider(provider_id: str, ctx: RequestContext = Depends(re
 class ModelProfileIn(BaseModel):
     key: str
     label: str
-    kind: str = "llm"  # llm | image | audio
+    kind: str = "llm"  # 仅支持对话档位（媒体生成已移除）
     provider: str = "openai"
     model: str = ""
     provider_id: str | None = None  # 对话档位绑定的 LLM 供应商
     base_url: str | None = None
     api_key_ref: str | None = None
     params_json: dict = {}
+    # 非空 = 建该项目专属档位；空 = 团队默认档位（所有项目可用）
+    project_id: str | None = None
 
 
 class ModelProfilePatch(BaseModel):
@@ -703,45 +728,61 @@ class ModelProfilePatch(BaseModel):
     model: str | None = None
     provider_id: str | None = None  # ""=解绑供应商
     base_url: str | None = None
-    api_key: str | None = None  # None=不动；""=清空；其它=替换（媒体档位的 inline key）
+    api_key: str | None = None  # None=不动；""=清空；其它=替换（档位的 inline key）
     params_json: dict | None = None  # 合并覆盖（不含 api_key）
 
 
 @router.get("/model-profiles")
-async def list_profiles(ctx: RequestContext = Depends(require(PERM_VIEW))):
+async def list_profiles(project_id: str = Query(""),
+                        ctx: RequestContext = Depends(require_admin())):
+    """档位列表：始终带团队默认；带 project_id 时再并入该项目的专属档位。
+
+    同名 key 在项目内优先解析项目行（orchestrator._load_profile 同口径），
+    这里两条都返回，界面用 project_id 区分「团队默认 / 本项目」。
+    """
     async with SessionLocal() as s:
-        rows = (await s.execute(select(ModelProfile).where(
-            ModelProfile.team_id == _u(ctx.team_id)).order_by(ModelProfile.created_at))).scalars().all()
+        pid = await _scoped_project(s, ctx, project_id) if project_id else None
+        cond = [ModelProfile.team_id == _u(ctx.team_id)]
+        if pid is not None:
+            cond.append(or_(ModelProfile.project_id.is_(None), ModelProfile.project_id == pid))
+        else:
+            cond.append(ModelProfile.project_id.is_(None))
+        rows = (await s.execute(select(ModelProfile).where(*cond)
+                                .order_by(ModelProfile.created_at))).scalars().all()
         provs = {p.id: p for p in (await s.execute(select(LlmProvider).where(
             LlmProvider.team_id == _u(ctx.team_id)))).scalars().all()}
-        # 角色绑定关系：配置页要显示"这个档位正被谁用"，删档位前得看得见
-        binds: dict[str, list[str]] = {}
+        # 角色绑定关系：配置页要显示"这个档位正被谁用"，删档位前得看得见。
+        # 团队默认档位统计团队级角色；项目档位统计该项目内的角色绑定。
+        binds: dict[tuple[str, str], list[str]] = {}
         for a in (await s.execute(select(Agent).where(
                 Agent.team_id == _u(ctx.team_id)))).scalars().all():
             if a.model_profile_key:
-                binds.setdefault(a.model_profile_key, []).append(a.key)
-            pj = a.params_json or {}
-            for f in ("image_profile", "audio_profile"):
-                if pj.get(f):
-                    binds.setdefault(pj[f], []).append(a.key)
+                scope = str(a.project_id) if a.project_id else ""
+                binds.setdefault((scope, a.model_profile_key), []).append(a.key)
         out = []
         for p in rows:
             params = dict(p.params_json or {})
             inline_key = params.pop("api_key", None) or p.api_key_ref
             has, hint = _key_hint(inline_key)
             pv = provs.get(p.provider_id) if p.provider_id else None
+            scope = str(p.project_id) if p.project_id else ""
+            inherited = bool(pid is not None and p.project_id is None)
             out.append({"id": str(p.id), "key": p.key, "label": p.label,
                         "kind": p.kind or "llm", "provider": p.provider, "model": p.model,
                         "provider_id": str(p.provider_id) if p.provider_id else None,
                         "provider_label": pv.label if pv else None,
                         "base_url": p.base_url, "has_key": has, "key_hint": hint,
-                        "params_json": params, "bound_roles": binds.get(p.key, [])})
+                        "params_json": params,
+                        "project_id": scope or None,
+                        "inherited": inherited,
+                        "bound_roles": binds.get((scope, p.key), [])})
         return {"profiles": out}
 
 
 class ModelProfileAutoIn(BaseModel):
     provider_id: str
     model: str
+    project_id: str | None = None  # 非空 = 优先复用/创建该项目的专属档位
 
 
 def _auto_key(key: str, model: str) -> str:
@@ -754,7 +795,8 @@ def _auto_key(key: str, model: str) -> str:
 
 
 @router.post("/model-profiles/auto")
-async def auto_profile(body: ModelProfileAutoIn, ctx: RequestContext = Depends(require(PERM_VIEW))):
+async def auto_profile(body: ModelProfileAutoIn,
+                       ctx: RequestContext = Depends(require_admin())):
     """选「供应商 → 模型」时复用/创建对话档位：同供应商+同模型直接复用，否则自动建档位。
     这样输入框旁就能直接选模型，不必先进设置页手工建档位。"""
     model = (body.model or "").strip()
@@ -767,15 +809,23 @@ async def auto_profile(body: ModelProfileAutoIn, ctx: RequestContext = Depends(r
         if not pv.enabled:
             raise HTTPException(status_code=400, detail="该供应商已停用")
         team = _u(ctx.team_id)
-        existing = (await s.execute(select(ModelProfile).where(
+        pid = await _scoped_project(s, ctx, body.project_id)
+        # 先找同作用域（项目优先，再团队默认）里同供应商+同模型的档位，能复用就不新建
+        base_q = select(ModelProfile).where(
             ModelProfile.team_id == team, ModelProfile.provider_id == pv.id,
-            ModelProfile.model == model, ModelProfile.kind == "llm"))).scalars().first()
+            ModelProfile.model == model, ModelProfile.kind == "llm")
+        existing = None
+        if pid is not None:
+            existing = await s.scalar(base_q.where(ModelProfile.project_id == pid))
+        if existing is None:
+            existing = await s.scalar(base_q.where(ModelProfile.project_id.is_(None)))
         if existing is not None:
             return {"key": existing.key, "created": False}
         key = _auto_key(pv.key, model)
         n = 2
         while await s.scalar(select(ModelProfile.id).where(
-                ModelProfile.team_id == team, ModelProfile.key == key)):
+                ModelProfile.team_id == team, ModelProfile.project_id == pid,
+                ModelProfile.key == key)):
             key = f"{_auto_key(pv.key, model)}-{n}"
             n += 1
         # 供应商模型目录里配了窗口/视觉就直接带进档位，选模型即生效；
@@ -788,14 +838,15 @@ async def auto_profile(body: ModelProfileAutoIn, ctx: RequestContext = Depends(r
             params["context_window"] = win
         if vision:
             params["vision"] = True
-        p = ModelProfile(team_id=team, key=key, label=model, kind="llm",
+        p = ModelProfile(team_id=team, project_id=pid, key=key, label=model, kind="llm",
                          provider=pv.protocol or "openai", model=model,
                          provider_id=pv.id, params_json=params)
         s.add(p)
         await s.commit()
         s.add(AuditLog(team_id=team, actor_id=_u(ctx.user_id),
                        action="profile.auto", target=key,
-                       detail_json={"provider": pv.key, "model": model}))
+                       detail_json={"provider": pv.key, "model": model,
+                                    "project_id": str(pid) if pid else None}))
         await s.commit()
         return {"key": key, "created": True}
 
@@ -804,25 +855,25 @@ async def auto_profile(body: ModelProfileAutoIn, ctx: RequestContext = Depends(r
 async def create_profile(body: ModelProfileIn, ctx: RequestContext = Depends(require(PERM_AGENT_CONFIG))):
     if not body.key.strip():
         raise HTTPException(status_code=400, detail="key 必填")
-    if body.kind == "llm" and not body.model.strip():
+    if not body.model.strip():
         raise HTTPException(status_code=400, detail="key/model 必填")
-    if body.kind not in ("llm", "image", "audio"):
-        raise HTTPException(status_code=400, detail="kind 必须是 llm/image/audio")
-    provider_id = None
-    if body.provider_id:
-        async with SessionLocal() as s:
+    if body.kind != "llm":
+        raise HTTPException(status_code=400, detail="kind 必须是 llm（媒体生成已移除）")
+    async with SessionLocal() as s:
+        pid = await _scoped_project(s, ctx, body.project_id)
+        provider_id = None
+        if body.provider_id:
             pv = await s.get(LlmProvider, _u(body.provider_id))
             if pv is None or str(pv.team_id) != ctx.team_id:
                 raise HTTPException(status_code=404, detail="所选供应商不存在")
-            if body.kind != "llm":
-                raise HTTPException(status_code=400, detail="只有对话档位绑定 LLM 供应商")
             provider_id = pv.id
-    async with SessionLocal() as s:
         exists = await s.scalar(select(ModelProfile).where(
-            ModelProfile.team_id == _u(ctx.team_id), ModelProfile.key == body.key))
+            ModelProfile.team_id == _u(ctx.team_id), ModelProfile.project_id == pid,
+            ModelProfile.key == body.key))
         if exists:
             raise HTTPException(status_code=409, detail="同名档位已存在")
-        p = ModelProfile(team_id=_u(ctx.team_id), key=body.key.strip(), label=body.label or body.key,
+        p = ModelProfile(team_id=_u(ctx.team_id), project_id=pid,
+                         key=body.key.strip(), label=body.label or body.key,
                          kind=body.kind, provider=body.provider, model=body.model,
                          provider_id=provider_id,
                          base_url=body.base_url, api_key_ref=body.api_key_ref,
@@ -833,6 +884,7 @@ async def create_profile(body: ModelProfileIn, ctx: RequestContext = Depends(req
         s.add(AuditLog(team_id=_u(ctx.team_id), actor_id=_u(ctx.user_id),
                        action="profile.add", target=p.key,
                        detail_json={"kind": p.kind, "model": p.model,
+                                    "project_id": str(pid) if pid else None,
                                     "provider_id": str(provider_id) if provider_id else None}))
         await s.commit()
         return {"id": str(p.id)}
@@ -853,8 +905,6 @@ async def update_profile(profile_id: str, body: ModelProfilePatch,
                 pv = await s.get(LlmProvider, _u(body.provider_id))
                 if pv is None or str(pv.team_id) != ctx.team_id:
                     raise HTTPException(status_code=404, detail="所选供应商不存在")
-                if p.kind != "llm":
-                    raise HTTPException(status_code=400, detail="只有对话档位绑定 LLM 供应商")
                 p.provider_id = pv.id
         if body.label is not None:
             p.label = body.label.strip() or p.label
@@ -873,7 +923,7 @@ async def update_profile(profile_id: str, body: ModelProfilePatch,
                 params.pop("api_key", None)
                 p.api_key_ref = None
         p.params_json = params
-        if p.kind == "llm" and not p.model:
+        if not p.model:
             raise HTTPException(status_code=400, detail="模型名不能为空")
         await s.commit()
         s.add(AuditLog(team_id=_u(ctx.team_id), actor_id=_u(ctx.user_id),
@@ -889,28 +939,33 @@ async def delete_profile(profile_id: str, ctx: RequestContext = Depends(require(
         p = await s.get(ModelProfile, _u(profile_id))
         if p is None or str(p.team_id) != ctx.team_id:
             raise HTTPException(status_code=404, detail="不存在")
-        key = p.key
-        # 删除档位时，清理仍绑定到它的智能体：否则角色 model_profile_key 会悬空，
-        # _load_profile 找不到档位 → 静默回退到陈旧的环境变量（OPENAI_*），
-        # 极易表现为莫名其妙的 HTTP 403（INVALID_API_KEY）。
-        bound = (await s.execute(
-            select(Agent).where(Agent.team_id == _u(ctx.team_id), Agent.model_profile_key == key)
-        )).scalars().all()
-        for a in bound:
-            a.model_profile_key = None
-        # 媒体档位（image/audio）也可能在 params_json 里引用该 key，一并解绑
-        for a in (await s.execute(
-            select(Agent).where(Agent.team_id == _u(ctx.team_id)))).scalars().all():
-            pj = a.params_json or {}
-            if pj.get("image_profile") == key or pj.get("audio_profile") == key:
-                pj = {**pj, "image_profile": None if pj.get("image_profile") == key else pj.get("image_profile"),
-                      "audio_profile": None if pj.get("audio_profile") == key else pj.get("audio_profile")}
-                a.params_json = pj
+        key, pid = p.key, p.project_id
         await s.delete(p)
+        await s.flush()
+        # 删档位时清理仍绑定到它、且删除后已无任何可解析档位的智能体：
+        # 悬空的 model_profile_key 会让 _load_profile 找不到档位 → 静默回退到
+        # 陈旧的环境变量（OPENAI_*），极易表现为莫名其妙的 HTTP 403。
+        # 同 key 的其它作用域档位仍在时不解除绑定（项目行删除会回落到团队默认）。
+        remaining = (await s.execute(select(ModelProfile).where(
+            ModelProfile.team_id == _u(ctx.team_id),
+            ModelProfile.key == key))).scalars().all()
+        have_team = any(x.project_id is None for x in remaining)
+        project_scopes = {str(x.project_id) for x in remaining if x.project_id}
+        bound = (await s.execute(select(Agent).where(
+            Agent.team_id == _u(ctx.team_id), Agent.model_profile_key == key))).scalars().all()
+        unbound: list[dict] = []
+        for a in bound:
+            resolvable = (have_team if a.project_id is None
+                          else (have_team or str(a.project_id) in project_scopes))
+            if not resolvable:
+                a.model_profile_key = None
+                unbound.append({"role": a.key,
+                                "project_id": str(a.project_id) if a.project_id else None})
         await s.commit()
         s.add(AuditLog(team_id=_u(ctx.team_id), actor_id=_u(ctx.user_id),
                        action="profile.delete", target=key,
-                       detail_json={"unbound_roles": [a.key for a in bound]}))
+                       detail_json={"project_id": str(pid) if pid else None,
+                                    "unbound_roles": unbound}))
         await s.commit()
     return {"ok": True}
 
@@ -928,24 +983,54 @@ def _u(v):  # type: ignore[no-untyped-def]
 class AgentIn(BaseModel):
     system_prompt: str | None = None
     model_profile_key: str | None = None
-    params_json: dict | None = None  # 媒体档位等扩展：image_profile / audio_profile
+    params_json: dict | None = None  # 扩展参数（如 reasoning_effort）
+    # 非空 = 写该项目的覆盖行；空 = 写团队默认行
+    project_id: str | None = None
+
+
+async def _scoped_project(s, ctx: RequestContext, project_id: str | None):
+    if not project_id:
+        return None
+    proj = await s.get(Project, _u(project_id))
+    if proj is None or str(proj.team_id) != ctx.team_id:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    return proj.id
 
 
 @router.get("/agents")
-async def list_agents(ctx: RequestContext = Depends(require(PERM_VIEW))):
+async def list_agents(project_id: str = Query(""), ctx: RequestContext = Depends(require_admin())):
+    """角色配置：返回项目作用域下的生效值（项目覆盖 → 团队默认 → 出厂）。
+
+    `inherited` 表示该项目没有覆盖、当前展示的是团队默认/出厂词，界面据此提示。
+    """
     async with SessionLocal() as s:
-        rows = (await s.execute(select(Agent).where(Agent.team_id == _u(ctx.team_id)))).scalars().all()
-        by_key = {a.key: a for a in rows}
+        pid = await _scoped_project(s, ctx, project_id) if project_id else None
+        rows = (await s.execute(select(Agent).where(
+            Agent.team_id == _u(ctx.team_id), Agent.project_id.is_(None)))).scalars().all()
+        defaults = {a.key: a for a in rows}
+        overrides: dict[str, Agent] = {}
+        if pid is not None:
+            prows = (await s.execute(select(Agent).where(
+                Agent.team_id == _u(ctx.team_id), Agent.project_id == pid))).scalars().all()
+            overrides = {a.key: a for a in prows}
         out = []
         for key in ROLES:
-            row = by_key.get(key)
+            base = defaults.get(key)
+            ov = overrides.get(key)
+            base_prompt = (base.system_prompt if base else "") or ROLE_PROMPTS.get(key, "")
             out.append({
                 "key": key,
-                "system_prompt": row.system_prompt if row else ROLE_PROMPTS.get(key, ""),
-                "model_profile_key": row.model_profile_key if row else None,
-                "params_json": (row.params_json or {}) if row else {},
+                "system_prompt": (ov.system_prompt if ov and ov.system_prompt else base_prompt),
+                "model_profile_key": ((ov.model_profile_key if ov else None) or
+                                      (base.model_profile_key if base else None)),
+                "params_json": {**((base.params_json if base else None) or {}),
+                                **((ov.params_json if ov else None) or {})},
                 "tools": ROLE_TOOLS.get(key, []),
-                "is_default": row is None,
+                "is_default": base is None and ov is None,
+                "inherited": ov is None,
+                "prompt_inherited": ov is None or not ov.system_prompt,
+                "model_inherited": ov is None or not ov.model_profile_key,
+                "project_id": project_id or None,
             })
         return {"agents": out}
 
@@ -955,10 +1040,21 @@ async def update_agent(key: str, body: AgentIn, ctx: RequestContext = Depends(re
     if key not in ROLES:
         raise HTTPException(status_code=404, detail="未知角色")
     async with SessionLocal() as s:
-        row = await s.scalar(select(Agent).where(Agent.team_id == _u(ctx.team_id), Agent.key == key))
+        pid = await _scoped_project(s, ctx, body.project_id)
+        row = await s.scalar(select(Agent).where(
+            Agent.team_id == _u(ctx.team_id), Agent.project_id == pid, Agent.key == key))
         if row is None:
-            row = Agent(team_id=_u(ctx.team_id), key=key, system_prompt=ROLE_PROMPTS.get(key, ""),
-                        model_profile_key=None, params_json={})
+            # 新建覆盖行：
+            # - 团队默认行必须带完整出厂词（它是该项目未覆盖时的兜底正文）；
+            # - 项目行未显式给提示词时存空串 = 继承团队默认（之后团队词升级能跟着走，
+            #   只覆盖模型绑定的项目不会被一份旧拷贝钉死）。
+            if pid is None:
+                prompt = (body.system_prompt if body.system_prompt is not None
+                          else ROLE_PROMPTS.get(key, ""))
+            else:
+                prompt = body.system_prompt or ""
+            row = Agent(team_id=_u(ctx.team_id), project_id=pid, key=key,
+                        system_prompt=prompt, model_profile_key=None, params_json={})
             s.add(row)
         if body.system_prompt is not None:
             row.system_prompt = body.system_prompt
@@ -980,45 +1076,64 @@ async def update_agent(key: str, body: AgentIn, ctx: RequestContext = Depends(re
             "params_json": body.params_json}.items() if v is not None]
         s.add(AuditLog(team_id=_u(ctx.team_id), actor_id=_u(ctx.user_id),
                        action="agent.update", target=key,
-                       detail_json={"fields": changed,
+                       detail_json={"fields": changed, "project_id": body.project_id or None,
                                     "model_profile_key": row.model_profile_key}))
         await s.commit()
         return {"ok": True}
 
 
-@router.post("/agents/{key}/reset")
-async def reset_agent(key: str, ctx: RequestContext = Depends(require(PERM_AGENT_CONFIG))):
-    """恢复该角色出厂 prompt（删除团队覆盖，回落默认）。"""
+@router.delete("/agents/{key}/override")
+async def drop_agent_override(key: str, project_id: str = Query(""),
+                              ctx: RequestContext = Depends(require(PERM_AGENT_CONFIG))):
+    """删除该项目的覆盖行，恢复继承团队默认（团队默认行不受影响）。"""
     if key not in ROLES:
         raise HTTPException(status_code=404, detail="未知角色")
+    if not project_id:
+        raise HTTPException(status_code=400, detail="缺少 project_id")
     async with SessionLocal() as s:
-        await s.execute(delete(Agent).where(Agent.team_id == _u(ctx.team_id), Agent.key == key))
+        pid = await _scoped_project(s, ctx, project_id)
+        await s.execute(delete(Agent).where(
+            Agent.team_id == _u(ctx.team_id), Agent.project_id == pid, Agent.key == key))
         await s.commit()
     return {"ok": True}
 
 
-# ---------------------------------------------------------------- 助手行为：默认权限 / 指导项
+@router.post("/agents/{key}/reset")
+async def reset_agent(key: str, project_id: str = Query(""),
+                      ctx: RequestContext = Depends(require(PERM_AGENT_CONFIG))):
+    """恢复出厂 prompt。带 project_id = 只删该项目的覆盖；不带 = 删团队默认覆盖。"""
+    if key not in ROLES:
+        raise HTTPException(status_code=404, detail="未知角色")
+    async with SessionLocal() as s:
+        pid = await _scoped_project(s, ctx, project_id) if project_id else None
+        await s.execute(delete(Agent).where(
+            Agent.team_id == _u(ctx.team_id), Agent.project_id == pid, Agent.key == key))
+        await s.commit()
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- 助手行为：指导项
 class PolicyIn(BaseModel):
-    permission_scope: str | None = None  # workspace|full
     guidance: list[dict] | None = None
 
 
 @router.get("/assistant-policy")
-async def get_assistant_policy(ctx: RequestContext = Depends(require(PERM_VIEW))):
-    """设置 → 助手行为：新会话的默认权限作用域 + 指导项（含内置默认项）。"""
+async def get_assistant_policy(ctx: RequestContext = Depends(require_admin())):
+    """设置 → 助手行为：指导项（含内置默认项）。
+
+    团队版助手行为固定「仅工作区」，permission_scope 只读返回，不再是可选项。
+    """
     pol = await policy_mod.load_policy()
-    return {**pol, "defaults": policy_mod.DEFAULT_GUIDANCE}
+    return {**pol, "permission_scope": policy_mod.DEFAULT_SCOPE,
+            "defaults": policy_mod.DEFAULT_GUIDANCE}
 
 
 @router.put("/assistant-policy")
 async def put_assistant_policy(body: PolicyIn,
                                ctx: RequestContext = Depends(require(PERM_AGENT_CONFIG))):
-    if body.permission_scope is not None and \
-            policy_mod.normalize_scope(body.permission_scope, "") != body.permission_scope:
-        raise HTTPException(status_code=400, detail="permission_scope 只能为 workspace 或 full")
     cur = await policy_mod.load_policy()
     pol = await policy_mod.save_policy(
-        body.permission_scope if body.permission_scope is not None else cur["permission_scope"],
+        policy_mod.DEFAULT_SCOPE,
         body.guidance if body.guidance is not None else cur["guidance"],
     )
     return {"ok": True, **pol}
@@ -1034,172 +1149,364 @@ def _local_offset_hours() -> int:
     return int(round((off.total_seconds() if off else 0) / 3600))
 
 
+# 用量页是「看一眼」的仪表盘，没必要每次重新扫描整个窗口：
+# 同一 (工作区, 窗口, 筛选) 的响应缓存 15s，切窗口/切筛选/切页面再回来都是秒开。
+# 15s 的陈旧度对统计页无感（它本来就不是实时流），换来的是不再重复扫 3 万行。
+_USAGE_CACHE: dict[tuple, tuple[float, dict]] = {}
+_USAGE_CACHE_TTL = 15.0
+
+
+def _hex(v) -> str:
+    """把 UUID / hex 字符串统一成 32 位 hex（库里的 uuid 列就是 hex 文本）。"""
+    return v.hex if hasattr(v, "hex") else str(v).replace("-", "")
+
+
 @router.get("/usage")
 async def usage(days: int = Query(30, ge=1, le=365),
                 agent: str | None = Query(None),
                 model: str | None = Query(None),
-                ctx: RequestContext = Depends(require(PERM_USAGE_VIEW))):
-    """用量台账。agent / model 可选筛选（类型筛选）：排除哪类调用拖低整体命中率的干扰，
-    比如只看项目组长自己的缓存命中率。facets 永远按未筛选的全集返回，避免选中后下拉只剩自己。"""
+                project_id: str | None = Query(None),
+                user_id: str | None = Query(None),
+                ctx: RequestContext = Depends(require(PERM_VIEW))):
+    """用量台账。
+
+    可见范围：管理员看全团队，可再按项目 / 成员筛选；其他角色强制只看自己
+    （project_id 只能选自己被分派的项目）。agent / model 仍是类型筛选。
+    facets 永远按未筛选的全集返回，避免选中后下拉只剩自己。
+    """
+    admin = is_admin_role(ctx.role)
+    if not admin:
+        # facets 回的是 32 位 hex，ctx 里是带连字符的 UUID：统一成 hex 再比，
+        # 否则用户在下拉里选自己/自己项目也会被判成越权。
+        if user_id and _hex(user_id) != _hex(ctx.user_id):
+            raise HTTPException(status_code=403, detail="只能查看自己的用量")
+        user_id = _hex(ctx.user_id)
+        if project_id and _hex(project_id) not in {_hex(x) for x in ctx.project_ids}:
+            raise HTTPException(status_code=403, detail="无权查看该项目")
+    ck = (str(ctx.team_id), days, agent or "", model or "",
+          project_id or "", user_id or "", "all" if admin else "self")
+    hit = _USAGE_CACHE.get(ck)
+    if hit and time.monotonic() - hit[0] < _USAGE_CACHE_TTL:
+        return hit[1]
+    data = await _usage_payload(ctx, days, agent, model, project_id, user_id, admin)
+    if len(_USAGE_CACHE) >= 32:  # 兜底：别让筛选组合把内存撑起来
+        _USAGE_CACHE.clear()
+    _USAGE_CACHE[ck] = (time.monotonic(), data)
+    return data
+
+
+async def _usage_payload(ctx: RequestContext, days: int, agent: str | None,
+                         model: str | None, project_id: str | None,
+                         user_id: str | None, admin: bool) -> dict:
+    """把窗口内的 llm_calls 一次扫进来，总量/按模型/按角色/按天/按项目/按会话/按成员
+    全部在内存里累加。
+
+    以前每个维度一条 SQL：同样是这几万行，被 SQLite 反复扫描 6 遍（实测 3.4 万行库上
+    单条 17~84ms，一页串行 ≈260ms），而一次扫描 + Python 累加只要一份 IO。
+    cast/累加的都是整数列，内存里做没有精度问题；365 天窗口也只会读一次。
+    """
     since = datetime.now(timezone.utc) - timedelta(days=days)
     tz_off = _local_offset_hours()
-    call_cond = [LlmCall.team_id == _u(ctx.team_id), LlmCall.created_at >= since]
-    if agent:
-        call_cond.append(LlmCall.agent_key == agent)
-    if model:
-        call_cond.append(LlmCall.model == model)
+    tid = _u(ctx.team_id)
+
+    # run 维度的可见范围：非管理员只能看自己发起的调用；项目筛选也落在 run 上。
+    run_where = ["team_id = :rtid", "created_at >= :rsince"]
+    run_params: dict = {"rtid": _hex(ctx.team_id), "rsince": since}
+    if project_id:
+        run_where.append("project_id = :rpid")
+        run_params["rpid"] = _hex(project_id)
+    elif not admin:
+        scoped = [_hex(x) for x in ctx.project_ids]
+        if not scoped:
+            run_where.append("1 = 0")
+        else:
+            marks = ",".join(f":rp{i}" for i in range(len(scoped)))
+            run_where.append(f"project_id IN ({marks})")
+            run_params.update({f"rp{i}": h for i, h in enumerate(scoped)})
+    if user_id:
+        run_where.append("triggered_by = :ruid")
+        run_params["ruid"] = _hex(user_id)
+    run_scope_sql = ("run_id IN (SELECT id FROM runs WHERE "
+                     + " AND ".join(run_where) + ")")
+
+    def _rate(cached: int, prompt: int, reported: int):
+        return round(cached / prompt * 100, 1) if prompt > 0 and reported > 0 else None
+
+    def _tps(completion: int, ms: int):
+        return round(completion / (ms / 1000), 1) if ms > 0 and completion > 0 else None
+
     async with SessionLocal() as s:
-        rows = (await s.execute(
-            select(UsageLedger.kind, func.coalesce(func.sum(UsageLedger.amount), 0))
-            .where(UsageLedger.team_id == _u(ctx.team_id), UsageLedger.created_at >= since)
-            .group_by(UsageLedger.kind))).all()
-        calls = (await s.execute(
-            select(func.count(), func.coalesce(func.sum(LlmCall.prompt_tokens), 0),
-                   func.coalesce(func.sum(LlmCall.completion_tokens), 0),
-                   func.coalesce(func.sum(LlmCall.latency_ms), 0),
-                   func.coalesce(func.sum(LlmCall.cached_tokens), 0),
-                   func.coalesce(func.sum(LlmCall.cache_reported), 0))
-            .where(*call_cond))).one()
-        # 按模型：调用数 / tokens / 总耗时 → 平均生成速度 + 缓存命中率
-        by_model = (await s.execute(
-            select(LlmCall.model, func.count(), func.coalesce(func.sum(LlmCall.prompt_tokens), 0),
-                   func.coalesce(func.sum(LlmCall.completion_tokens), 0),
-                   func.coalesce(func.sum(LlmCall.latency_ms), 0),
-                   func.coalesce(func.sum(LlmCall.cached_tokens), 0),
-                   func.coalesce(func.sum(LlmCall.cache_reported), 0))
-            .where(*call_cond)
-            .group_by(LlmCall.model)
-            .order_by(func.count().desc()))).all()
-        # 按角色：调用数 + tokens + 命中率（哪个角色把整体命中率拖低了，在这里拆开看）
-        by_agent = (await s.execute(
-            select(LlmCall.agent_key, func.count(),
-                   func.coalesce(func.sum(LlmCall.prompt_tokens + LlmCall.completion_tokens), 0),
-                   func.coalesce(func.sum(LlmCall.prompt_tokens), 0),
-                   func.coalesce(func.sum(LlmCall.cached_tokens), 0),
-                   func.coalesce(func.sum(LlmCall.cache_reported), 0),
-                   func.coalesce(func.sum(LlmCall.completion_tokens), 0),
-                   func.coalesce(func.sum(LlmCall.latency_ms), 0))
-            .where(*call_cond)
-            .group_by(LlmCall.agent_key))).all()
-        # 筛选下拉候选项：按未筛选的全集算
-        facet_base = [LlmCall.team_id == _u(ctx.team_id), LlmCall.created_at >= since]
-        agent_facets = [r[0] for r in (await s.execute(
-            select(LlmCall.agent_key).where(*facet_base, LlmCall.agent_key.is_not(None))
-            .group_by(LlmCall.agent_key)
-            .order_by(func.sum(LlmCall.prompt_tokens).desc()))).all()]
-        model_facets = [r[0] for r in (await s.execute(
-            select(LlmCall.model).where(*facet_base, LlmCall.model.is_not(None))
-            .group_by(LlmCall.model)
-            .order_by(func.sum(LlmCall.prompt_tokens).desc()))).all()]
-        # 按项目：经 run 关联聚合（无 run 的调用不计入）
-        by_project = (await s.execute(
-            select(Run.project_id, func.count(),
-                   func.coalesce(func.sum(LlmCall.prompt_tokens), 0),
-                   func.coalesce(func.sum(LlmCall.completion_tokens), 0),
-                   func.coalesce(func.sum(LlmCall.latency_ms), 0))
-            .join(Run, Run.id == LlmCall.run_id)
-            .where(*call_cond)
-            .group_by(Run.project_id))).all()
-        # 按天（本地日切）：调用数 + tokens，供趋势图
-        day_expr = func.date(func.datetime(LlmCall.created_at, f"{tz_off:+d} hours"))
-        by_day = (await s.execute(
-            select(day_expr, func.count(),
-                   func.coalesce(func.sum(LlmCall.prompt_tokens + LlmCall.completion_tokens), 0),
-                   func.coalesce(func.sum(LlmCall.completion_tokens), 0),
-                   func.coalesce(func.sum(LlmCall.latency_ms), 0))
-            .where(*call_cond)
-            .group_by(day_expr).order_by(day_expr))).all()
-        # 按会话：整体命中率被哪条会话拉低的一眼可见（只取用量前 50 条会话）
-        by_session = (await s.execute(
-            select(Session.id, Session.title, Project.name, func.count(),
-                   func.coalesce(func.sum(LlmCall.prompt_tokens), 0),
-                   func.coalesce(func.sum(LlmCall.completion_tokens), 0),
-                   func.coalesce(func.sum(LlmCall.latency_ms), 0),
-                   func.coalesce(func.sum(LlmCall.cached_tokens), 0),
-                   func.coalesce(func.sum(LlmCall.cache_reported), 0))
-            .select_from(LlmCall)
-            .join(Run, Run.id == LlmCall.run_id)
-            .join(Session, Session.id == Run.session_id)
-            .join(Project, Project.id == Session.project_id)
-            .where(*call_cond)
-            .group_by(Session.id, Session.title, Project.name)
-            .order_by(func.sum(LlmCall.prompt_tokens).desc())
-            .limit(50))).all()
-        names = {str(r[0]): r[1] for r in (await s.execute(
-            select(Project.id, Project.name).where(Project.team_id == _u(ctx.team_id)))).all()}
+        ledger_where = "team_id = :tid AND created_at >= :since"
+        if not admin:
+            ledger_where += " AND " + run_scope_sql
+        rows = (await s.execute(text(
+            "SELECT kind, COALESCE(SUM(amount), 0) FROM usage_ledger"
+            " WHERE " + ledger_where + " GROUP BY kind"),
+            {"tid": _hex(tid), "since": since, **run_params})).all()
+        # 一次扫描把窗口内的调用全取回来，各维度在内存里累加。
+        # 以前是 8 条各自带 team_id+created_at 条件的聚合，SQLite 把同几万行反复扫了 8 遍
+        # （3.4 万行库实测 287ms）；一次扫描只要 ~80ms。这里直接下发原生 SQL 而不是走 ORM：
+        # ORM 的 Uuid/UTCDateTime 列会逐行做类型转换，能加回来几百毫秒。
+        where = ["team_id = :tid", "created_at >= :since"]
+        params: dict = {"tid": _hex(tid), "since": since}
+        if agent:
+            where.append("agent_key = :agent")
+            params["agent"] = agent
+        if model:
+            where.append("model = :model")
+            params["model"] = model
+        if not admin or project_id or user_id:
+            where.append(run_scope_sql)
+            params.update(run_params)
+        scan = (await s.execute(text(
+            "SELECT created_at, prompt_tokens, completion_tokens,"
+            " cached_tokens, cache_reported, latency_ms, model, agent_key, run_id"
+            " FROM llm_calls WHERE " + " AND ".join(where)), params)).all()
+        # 本地日切：created_at 是 UTC 文本，按服务器时区偏移归日（否则「今天」会差一天）。
+        # 逐行做偏移解析太贵，这里只解一次基准日，用「日期 → 偏移后日期」的缓存摊掉。
+        _day_cache: dict[str, str] = {}
+
+        acc: dict[str, list[int]] = {}       # model -> [calls, prompt, completion, ms, cached, reported]
+        ag: dict[str, list[int]] = {}        # agent_key -> [calls, tokens, prompt, cached, reported, completion, ms]
+        dy: dict[str, list[int]] = {}        # 本地日 -> [calls, tokens, completion, ms]
+        totals = [0, 0, 0, 0, 0, 0]          # calls, prompt, completion, ms, cached, reported
+        run_ids: set = set()
+        for (created_at, p, ct, ca, rep, ms, m, ak, rid) in scan:
+            p, ct, ca, rep, ms = int(p or 0), int(ct or 0), int(ca or 0), int(rep or 0), int(ms or 0)
+            totals[0] += 1
+            totals[1] += p
+            totals[2] += ct
+            totals[3] += ms
+            totals[4] += ca
+            totals[5] += rep
+            b = acc.setdefault(m or "unknown", [0, 0, 0, 0, 0, 0])
+            b[0] += 1
+            b[1] += p
+            b[2] += ct
+            b[3] += ms
+            b[4] += ca
+            b[5] += rep
+            a = ag.setdefault(ak or "unknown", [0, 0, 0, 0, 0, 0, 0])
+            a[0] += 1
+            a[1] += p + ct
+            a[2] += p
+            a[3] += ca
+            a[4] += rep
+            a[5] += ct
+            a[6] += ms
+            # 本地日切：同一毫秒级的 created_at 前缀会大量重复，按「UTC 小时」缓存归日结果。
+            # created_at 的类型随方言变：SQLite 的原生 SQL 回来是文本，MySQL/aiomysql 回来是
+            # datetime 对象——直接切片会 TypeError（线上 MySQL 版 /api/usage 一直 500 的原因）。
+            # 两种都 str() 后取前 13 位：'YYYY-MM-DD HH' 与 'YYYY-MM-DDTHH' 都能被 fromisoformat 吃下。
+            utc_hour = str(created_at)[:13]
+            dkey = _day_cache.get(utc_hour)
+            if dkey is None:
+                dkey = (datetime.fromisoformat(utc_hour + ":00:00")
+                        + timedelta(hours=tz_off)).strftime("%Y-%m-%d")
+                _day_cache[utc_hour] = dkey
+            d = dy.setdefault(dkey, [0, 0, 0, 0])
+            d[0] += 1
+            d[1] += p + ct
+            d[2] += ct
+            d[3] += ms
+            if rid is not None:
+                run_ids.add(rid)
+        by_day = [(k, *v) for k, v in sorted(dy.items())]
+        # 下拉候选项按「未筛选全集」算：选中某项后下拉不能只剩它自己。
+        # 筛选生效时补一次同一窗口的轻列扫描（只在用户真用了筛选时发生，且有 15s 缓存）。
+        facet_agent: dict[str, int] = {}
+        facet_model: dict[str, int] = {}
+        if agent or model:
+            facet_where = ["team_id = :tid", "created_at >= :since"]
+            facet_params: dict = {"tid": _hex(tid), "since": since}
+            if not admin or project_id or user_id:
+                facet_where.append(run_scope_sql)
+                facet_params.update(run_params)
+            full = (await s.execute(text(
+                "SELECT agent_key, model, prompt_tokens FROM llm_calls"
+                " WHERE " + " AND ".join(facet_where)), facet_params)).all()
+            for ak, m, p in full:
+                if ak is not None:
+                    facet_agent[ak] = facet_agent.get(ak, 0) + int(p or 0)
+                if m is not None:
+                    facet_model[m] = facet_model.get(m, 0) + int(p or 0)
+        else:
+            facet_agent = {a: v[2] for a, v in ag.items()}
+            facet_model = {m: v[1] for m, v in acc.items()}
+        agent_facets = [k for k, _ in sorted(facet_agent.items(), key=lambda x: -x[1])]
+        model_facets = [k for k, _ in sorted(facet_model.items(), key=lambda x: -x[1])]
+        # 按项目/按会话：run → session → project 的归属关系一次性取回（只查用到的 id），
+        # 不再对每行 llm_call 做三重 join 再 group by。
+        run_owner: dict = {}
+        if run_ids:
+            id_list = list(run_ids)
+            for i in range(0, len(id_list), 500):  # SQLite 绑定参数有上限，分批查
+                marks = ",".join(f":r{j}" for j in range(len(id_list[i:i + 500])))
+                for rid, pid, sid, uid in (await s.execute(text(
+                        "SELECT id, project_id, session_id, triggered_by FROM runs"
+                        " WHERE id IN (" + marks + ")"),
+                        {f"r{j}": h for j, h in enumerate(id_list[i:i + 500])})).all():
+                    run_owner[_hex(rid)] = (pid, sid, uid)
+        names = {_hex(r[0]): r[1] for r in (await s.execute(text(
+            "SELECT id, name FROM projects WHERE team_id = :tid"),
+            {"tid": _hex(tid)})).all()}
+        sid_list = list({_hex(v[1]) for v in run_owner.values()})
+        sess_title: dict = {}
+        sess_pid: dict = {}
+        if sid_list:
+            for i in range(0, len(sid_list), 500):
+                chunk = sid_list[i:i + 500]
+                marks = ",".join(f":s{j}" for j in range(len(chunk)))
+                for sid, title, pid in (await s.execute(text(
+                        "SELECT id, title, project_id FROM sessions WHERE id IN (" + marks + ")"),
+                        {f"s{j}": h for j, h in enumerate(chunk)})).all():
+                    k = _hex(sid)
+                    sess_title[k] = title
+                    sess_pid[k] = _hex(pid)
+        by_project: dict = {}
+        by_session: dict = {}
+        by_user: dict = {}
+        # run → (项目hex, 会话hex, 成员hex) 先算一次：如果按每一行调用去转 UUID，
+        # 3.4 万行就是 21 万次字符串转换（实测占总耗时 1/3）。
+        owner_hex = {rid: (_hex(p), _hex(s), _hex(u))
+                     for rid, (p, s, u) in run_owner.items()}
+        for (created_at, p, ct, ca, rep, ms, m, ak, rid) in scan:
+            owner = owner_hex.get(rid) if rid is not None else None
+            if not owner:
+                continue          # 没有 run 归属的调用不计入「按项目/按会话」（与旧口径一致）
+            pid, sid, uid = owner
+            p, ct, ca, rep, ms = int(p or 0), int(ct or 0), int(ca or 0), int(rep or 0), int(ms or 0)
+            bp = by_project.setdefault(pid, [0, 0, 0, 0])
+            bp[0] += 1
+            bp[1] += p
+            bp[2] += ct
+            bp[3] += ms
+            bs = by_session.setdefault(sid, [0, 0, 0, 0, 0, 0])
+            bs[0] += 1
+            bs[1] += p
+            bs[2] += ct
+            bs[3] += ms
+            bs[4] += ca
+            bs[5] += rep
+            bu = by_user.setdefault(uid, [0, 0, 0, 0, 0, 0])
+            bu[0] += 1
+            bu[1] += p
+            bu[2] += ct
+            bu[3] += ms
+            bu[4] += ca
+            bu[5] += rep
+        by_session = sorted(by_session.items(), key=lambda kv: -kv[1][1])[:50]
+        # 成员名：用量表只有用户 id，界面要显示「谁在用」
+        user_names: dict = {}
+        if by_user:
+            uid_list = list(by_user)
+            for i in range(0, len(uid_list), 500):
+                chunk = uid_list[i:i + 500]
+                marks = ",".join(f":u{j}" for j in range(len(chunk)))
+                for uid, username, display in (await s.execute(text(
+                        "SELECT id, username, display_name FROM users WHERE id IN (" + marks + ")"),
+                        {f"u{j}": h for j, h in enumerate(chunk)})).all():
+                    user_names[_hex(uid)] = display or username or "未知成员"
+
         # 模型名 → 档位/供应商：用量表里只有裸模型名，光看名字猜不出走的哪个端点
-        prov_labels = {p.id: p.label for p in (await s.execute(
-            select(LlmProvider).where(LlmProvider.team_id == _u(ctx.team_id)))).scalars().all()}
+        prov_labels = {r[0]: r[1] for r in (await s.execute(text(
+            "SELECT id, label FROM llm_providers WHERE team_id = :tid"),
+            {"tid": _hex(tid)})).all()}
         prof_by_model: dict[str, dict] = {}
-        for pr in (await s.execute(select(ModelProfile).where(
-                ModelProfile.team_id == _u(ctx.team_id)))).scalars().all():
-            if pr.model:
-                prof_by_model.setdefault(pr.model, {
-                    "profile": pr.label, "kind": pr.kind or "llm",
-                    "provider": prov_labels.get(pr.provider_id) if pr.provider_id else None})
+        for model_name, label, kind, prov_id in (await s.execute(text(
+                "SELECT model, label, kind, provider_id FROM model_profiles"
+                " WHERE team_id = :tid"), {"tid": _hex(tid)})).all():
+            if model_name:
+                prof_by_model.setdefault(model_name, {
+                    "profile": label, "kind": kind or "llm",
+                    "provider": prov_labels.get(prov_id) if prov_id else None})
 
-        def _rate(cached: int, prompt: int, reported: int):
-            return round(cached / prompt * 100, 1) if prompt > 0 and reported > 0 else None
-
-        total_ms = int(calls[3])
-        completion = int(calls[2])
-        prompt_total = int(calls[1])
-        models = [{"model": m or "unknown", "calls": int(c), "prompt": int(p),
-                   "completion": int(ct), "latency_ms": int(ms),
-                   "cached": int(ca), "cache_hit_rate": _rate(int(ca), int(p), int(rep)),
-                   "tokens_per_sec": round(ct / (ms / 1000), 1) if ms > 0 and ct > 0 else None,
+        prompt_total = totals[1]
+        completion = totals[2]
+        total_ms = totals[3]
+        models = [{"model": m or "unknown", "calls": v[0], "prompt": v[1],
+                   "completion": v[2], "latency_ms": v[3],
+                   "cached": v[4], "cache_hit_rate": _rate(v[4], v[1], v[5]),
+                   "tokens_per_sec": _tps(v[2], v[3]),
                    **(prof_by_model.get(m) or {})}
-                  for m, c, p, ct, ms, ca, rep in by_model]
+                  for m, v in acc.items()]
         models.sort(key=lambda x: -(x["calls"] + x["prompt"] + x["completion"]))
-        projects = [{"project_id": str(pid), "project": names.get(str(pid), str(pid)),
-                     "calls": int(c), "prompt": int(p), "completion": int(ct),
-                     "latency_ms": int(ms),
-                     "tokens_per_sec": round(int(ct) / (int(ms) / 1000), 1)
-                     if int(ms) > 0 and int(ct) > 0 else None}
-                    for pid, c, p, ct, ms in by_project]
+        projects = [{"project_id": pid, "project": names.get(pid, pid),
+                     "calls": v[0], "prompt": v[1], "completion": v[2],
+                     "latency_ms": v[3], "tokens_per_sec": _tps(v[2], v[3])}
+                    for pid, v in by_project.items()]
         projects.sort(key=lambda x: -(x["calls"] + x["prompt"] + x["completion"]))
-        days_out = []
-        for d, c, t, ct, ms in by_day:
-            days_out.append({"date": str(d), "calls": int(c), "tokens": int(t),
-                             "completion": int(ct),
-                             "tokens_per_sec": round(int(ct) / (int(ms) / 1000), 1)
-                             if int(ms) > 0 and int(ct) > 0 else None})
-        sessions = [{"session_id": str(sid), "title": title or (pname or "未命名会话"),
-                     "calls": int(c), "prompt": int(p), "completion": int(ct),
-                     "latency_ms": int(ms), "cached": int(ca),
-                     "cache_hit_rate": _rate(int(ca), int(p), int(rep)),
-                     "tokens_per_sec": round(int(ct) / (int(ms) / 1000), 1)
-                     if int(ms) > 0 and int(ct) > 0 else None}
-                    for sid, title, pname, c, p, ct, ms, ca, rep in by_session]
-        # run 成功率：光看 token 看不出这批钱花得值不值
-        run_stats = (await s.execute(
-            select(Run.status, func.count()).where(
-                Run.team_id == _u(ctx.team_id), Run.created_at >= since)
-            .group_by(Run.status))).all()
+        days_out = [{"date": str(d), "calls": v[0], "tokens": v[1],
+                     "completion": v[2], "tokens_per_sec": _tps(v[2], v[3])}
+                    for d, *v in by_day]
+        sessions = [{"session_id": str(sid),
+                     "title": sess_title.get(sid) or names.get(sess_pid.get(sid, ""), "") or "未命名会话",
+                     "calls": v[0], "prompt": v[1], "completion": v[2],
+                     "latency_ms": v[3], "cached": v[4],
+                     "cache_hit_rate": _rate(v[4], v[1], v[5]),
+                     "tokens_per_sec": _tps(v[2], v[3])}
+                    for sid, v in by_session]
+        # 按成员：管理员看排行，其他人只会有自己这一行（scope 已在 run_where 里收紧）
+        members = [{"user_id": uid,
+                    "user": user_names.get(uid, "未知成员"),
+                    "calls": v[0], "prompt": v[1], "completion": v[2],
+                    "latency_ms": v[3], "cached": v[4],
+                    "cache_hit_rate": _rate(v[4], v[1], v[5]),
+                    "tokens_per_sec": _tps(v[2], v[3])}
+                   for uid, v in by_user.items()]
+        members.sort(key=lambda x: -(x["calls"] + x["prompt"] + x["completion"]))
+        # 筛选下拉：项目/成员按「可见范围全集」返回，不随 agent/model 收窄
+        if admin:
+            user_rows = (await s.execute(text(
+                "SELECT u.id, u.username, u.display_name FROM users u"
+                " JOIN team_members m ON m.user_id = u.id"
+                " WHERE m.team_id = :tid"), {"tid": _hex(tid)})).all()
+        else:
+            user_rows = (await s.execute(text(
+                "SELECT id, username, display_name FROM users WHERE id = :uid"),
+                {"uid": _hex(ctx.user_id)})).all()
+        user_facets = sorted(
+            ({"user_id": _hex(r[0]), "user": r[2] or r[1] or "未知成员"}
+             for r in user_rows), key=lambda x: x["user"])
+        if admin:
+            project_facets = [{"project_id": pid, "project": nm}
+                              for pid, nm in names.items()]
+        else:
+            visible = {_hex(x) for x in ctx.project_ids}
+            project_facets = [{"project_id": pid, "project": nm}
+                              for pid, nm in names.items() if pid in visible]
+        project_facets.sort(key=lambda x: x["project"])
+        # run 成功率：光看 token 看不出这批钱花得值不值。
+        # 必须和 token 口径同源，否则成员会看到全团队的 run 计数。
+        run_stats = (await s.execute(text(
+            "SELECT status, COUNT(*) FROM runs WHERE " + " AND ".join(run_where)
+            + " GROUP BY status"), run_params)).all()
         return {
             "days": days,
             "tokens": {
-                "prompt": prompt_total, "completion": completion, "calls": int(calls[0]),
+                "prompt": prompt_total, "completion": completion, "calls": totals[0],
                 "latency_ms": total_ms,
-                "cached": int(calls[4]),
-                "cache_hit_rate": _rate(int(calls[4]), prompt_total, int(calls[5])),
-                "tokens_per_sec": round(completion / (total_ms / 1000), 1)
-                if total_ms > 0 and completion > 0 else None,
+                "cached": totals[4],
+                "cache_hit_rate": _rate(totals[4], prompt_total, totals[5]),
+                "tokens_per_sec": _tps(completion, total_ms),
             },
             "runs": {k or "unknown": int(v) for k, v in run_stats},
             "ledger": {k: int(v) for k, v in rows},
             "by_model": models,
             "by_project": projects,
+            "by_user": members,
             "by_day": days_out,
             "by_session": sessions,
             "agent_facets": agent_facets,
             "model_facets": model_facets,
-            "by_agent": {k or "unknown": {
-                "calls": int(c), "tokens": int(t), "prompt": int(p), "cached": int(ca),
-                "cache_hit_rate": _rate(int(ca), int(p), int(rep)),
-                "tokens_per_sec": round(int(ct) / (int(ms) / 1000), 1)
-                if int(ms) > 0 and int(ct) > 0 else None}
-                for k, c, t, p, ca, rep, ct, ms in by_agent},
+            "project_facets": project_facets,
+            "user_facets": user_facets,
+            "scope": "all" if admin else "self",
+            "by_agent": {k: {
+                "calls": v[0], "tokens": v[1], "prompt": v[2], "cached": v[3],
+                "cache_hit_rate": _rate(v[3], v[2], v[4]),
+                "tokens_per_sec": _tps(v[5], v[6])}
+                for k, v in ag.items()},
         }
 
 
@@ -1207,8 +1514,8 @@ async def usage(days: int = Query(30, ge=1, le=365),
 @router.get("/audit")
 async def audit(limit: int = Query(50, ge=1, le=500),
                 q: str | None = Query(None, max_length=40),
-                ctx: RequestContext = Depends(require(PERM_USAGE_VIEW))):
-    """操作留痕。q 按动作/对象模糊过滤（配置类记录一多，光翻页找不到那次改了什么）。"""
+                ctx: RequestContext = Depends(require_admin())):
+    """操作留痕（仅管理员）。q 按动作/对象模糊过滤（配置类记录一多，光翻页找不到那次改了什么）。"""
     async with SessionLocal() as s:
         stmt = select(AuditLog).where(AuditLog.team_id == _u(ctx.team_id))
         if q:

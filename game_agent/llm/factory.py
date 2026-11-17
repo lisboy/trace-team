@@ -1,6 +1,7 @@
 """LLM 工厂：按配置与角色选择大脑（设计 §2.4 统一适配层）。
 
-优先级：Agent 绑定的 ModelProfile（经 ctx.model_profile 传入）> GA_ROLE_MODELS > GA_LLM_MODEL。
+模型只来自管理员绑定的「模型档位」（经 ctx.model_profile 传入）；团队版没有 .env
+全局兜底——拿不到可用档位就直接报错，由上层（run 收尾 / 设置页自检）告诉用户去绑定。
 协议：profile["protocol"]（来自供应商）决定用哪套适配器——
   - anthropic → AnthropicMessagesLLM（/v1/messages 原生协议）
   - 其它/缺省 → OpenAICompatibleLLM（/v1/chat/completions，OpenAI 兼容）
@@ -10,8 +11,6 @@ max_tokens（仅 anthropic：单次回复上限）。
 """
 from __future__ import annotations
 
-import logging
-
 from game_agent.config import (
     LLM_MAX_OUTPUT_TOKENS, LLM_MODEL, LLM_SUB_MAX_OUTPUT_TOKENS,
     LLM_SUB_REASONING_EFFORT, ROLE_MODELS,
@@ -19,8 +18,6 @@ from game_agent.config import (
 from game_agent.llm.anthropic_compat import AnthropicMessagesLLM
 from game_agent.llm.base import Ctx, LLM
 from game_agent.llm.openai_compat import OpenAICompatibleLLM
-
-log = logging.getLogger("game_agent.llm.factory")
 
 
 def _effort_for(role: str, params: dict) -> str:
@@ -38,23 +35,40 @@ def _effort_for(role: str, params: dict) -> str:
     return ""
 
 
+def profile_issue(profile: dict | None) -> str | None:
+    """档位可用性检查：返回问题描述（可用返回 None）。
+
+    团队版没有 .env 全局兜底模型，所以「模型 / 地址 / Key」缺一不可；缺了就不要
+    构造适配器——否则请求会在很深的地方失败，界面看起来像「模型不响应」。
+    """
+    if not profile:
+        return "未绑定模型档位"
+    if not str(profile.get("model") or "").strip():
+        return "档位没有模型名"
+    if not str(profile.get("base_url") or "").strip():
+        return "档位没有可用的 Base URL"
+    if not str(profile.get("api_key") or profile.get("api_key_ref") or "").strip():
+        return "档位没有可用的 API Key"
+    return None
+
+
 def build_llm(role: str, ctx: Ctx | None = None) -> LLM:
-    """始终构建真实大模型适配器。没有 mock/离线演示模式：
-    有绑定档位/供应商就走它，否则回退到 .env 全局兜底。"""
+    """构建真实大模型适配器。
+
+    没有 mock 模式，也没有 .env 全局兜底：拿不到可用的绑定档位就抛错，
+    由调用方（run 收尾 / 纯文本辅助功能）决定「报给用户」还是「跳过这一步」。
+    """
     if ctx is not None and isinstance(ctx.model_profile, LLM):
         # 测试/调用方直接注入了一个假大脑：原样返回（本仓库冒烟测试靠它离线跑整轮）。
         return ctx.model_profile
     profile = (ctx.model_profile if ctx else None) or {}
+    issue = profile_issue(profile)
+    if issue:
+        raise RuntimeError(f"{issue}：团队版不提供 .env 全局兜底模型，"
+                           "请管理员在「项目配置 / 智能体」里绑定模型档位。")
     params = profile.get("params") or {}
     model = profile.get("model") or ROLE_MODELS.get(role) or LLM_MODEL
     protocol = str(profile.get("protocol") or "openai").lower()
-    if not (profile.get("api_key") or profile.get("api_key_ref")):
-        # 档位没带 Key 时适配器回退到 OPENAI_API_KEY；两者都没有，请求注定 401/403。
-        from game_agent.config import OPENAI_API_KEY
-        if not OPENAI_API_KEY:
-            log.warning("角色 %r 没有可用档位、.env 也未配 OPENAI_API_KEY："
-                        "本轮请求会因缺鉴权失败（model=%r, base=%r）",
-                        role, model, profile.get("base_url"))
     common = dict(
         role=role, model=model,
         api_key=(profile.get("api_key") or profile.get("api_key_ref")),

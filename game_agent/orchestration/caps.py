@@ -1,4 +1,4 @@
-"""运行能力开关：自动化测试 / 联网 / 出图配音。
+"""运行能力开关：自动化测试 / 联网。
 
 原先前端「运行选项」里有这三个勾选，现在这块 UI 已移除——用哪个工具完全由模型按任务判断。
 保留本模块是为了：老客户端/API 仍可显式传 caps，传了就按它裁剪。
@@ -8,12 +8,7 @@ from __future__ import annotations
 
 CAP_TEST_TOOLS = {"start_service", "stop_service", "service_logs", "screenshot_page"}
 CAP_WEB_TOOLS = {"web_search", "web_fetch"}
-CAP_MEDIA_TOOLS = {
-    "generate_image", "edit_image", "save_character_sheet", "generate_audio",
-    "generate_video", "list_voice_presets", "tts", "design_voice", "generate_sfx",
-    "generate_music", "upsert_voice_profile",
-}
-CAP_DEFAULTS = {"test": True, "web": True, "media": True}
+CAP_DEFAULTS = {"test": True, "web": True}
 
 
 def normalize_caps(raw: object) -> dict[str, bool]:
@@ -32,8 +27,6 @@ def caps_tool_filter(whitelist: list[str], caps: dict[str, bool]) -> list[str]:
         drop |= CAP_TEST_TOOLS
     if not caps.get("web", True):
         drop |= CAP_WEB_TOOLS
-    if not caps.get("media", True):
-        drop |= CAP_MEDIA_TOOLS
     return [w for w in whitelist if w not in drop] if drop else whitelist
 
 
@@ -64,7 +57,4 @@ def caps_hint(caps: dict[str, bool]) -> str:
     if not caps.get("web", True):
         parts.append("【本轮关闭了联网】不要 web_search / web_fetch；缺外部资料就基于现有代码判断，"
                      "并把不确定的地方写进汇报。")
-    if not caps.get("media", True):
-        parts.append("【本轮关闭了出图与配音】不要调用 generate_image / edit_image / generate_audio / tts "
-                     "等媒体工具；任务需要素材时先说明「需要开启出图/配音」再继续。")
     return "\n".join(parts)

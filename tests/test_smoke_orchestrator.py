@@ -6,7 +6,7 @@
    「运行时硬提示」的判定逻辑，是"组长只勘察不动手"和"要图却去翻仓库"两个
    实测故障的修复点，必须锁住行为；
 3. **lite 引擎**：临时 SQLite 上装配 CoreServices，跑一次锁的申请/释放；
-4. **真 run**：MockBrain 驱动一整轮 modify（读工程 → 写代码 → 派美术出占位图 →
+4. **真 run**：MockBrain 驱动一整轮 modify（读工程 → 写代码 →
    跑 pytest → 汇报），断言 run 落到 succeeded 且回复消息真的落库。
 """
 from __future__ import annotations
@@ -77,16 +77,16 @@ async def _seed(session_factory, requirement: str) -> dict[str, str]:
 
 # ---------------------------------------------------------------- 1. wiring
 def test_role_tools_wiring() -> None:
-    """main 角色在（动手工具齐全）；sub 是 spawn_agents 派出的只读子agent（无写/跑/生成权限）。"""
+    """main 角色在（动手工具齐全）；sub 是 spawn_agents 派出的只读子agent（无写/跑权限）。"""
     assert set(ROLE_TOOLS) == {"main", "sub"}
     main = set(ROLE_TOOLS["main"])
     for tool in ("write_file", "edit_file", "run_command", "start_service",
-                 "generate_image", "generate_audio"):
+                 "spawn_agents", "report_to_user"):
         assert tool in main, f"助手缺少工具 {tool}"
-    # 子agent 只读，不能写/跑/生成，也不能递归派发
+    # 子agent 只读，不能写/跑，也不能递归派发
     sub = set(ROLE_TOOLS["sub"])
     assert not (sub & {"write_file", "edit_file", "run_command", "start_service",
-                       "generate_image", "generate_audio", "spawn_agents"})
+                       "spawn_agents"})
 
 
 def test_orchestrator_constructs(session_factory) -> None:
@@ -132,22 +132,17 @@ def test_cmd_is_readonly(cmd: str, readonly: bool) -> None:
     assert Orchestrator._cmd_is_readonly(cmd) is readonly
 
 
-def test_intent_hint_routes_media_requests() -> None:
-    """出图/配音需求必须被前置成 generate_image / generate_audio 硬指令。"""
-    assert "generate_image" in Orchestrator._intent_hint("给主界面生成一张背景图")
-    assert "generate_audio" in Orchestrator._intent_hint("给这个角色配一句台词")
-    assert Orchestrator._intent_hint("把排序改成按稀有度") == ""
+def test_readonly_toolset_for_viewer_runs() -> None:
+    """需求角色硬只读：只读白名单必须是主agent 工具表的子集，且不含任何写/跑/派发。"""
+    from game_agent.agents.roles import READONLY_TOOLS
 
-
-def test_intent_hint_known_gap_plain_wording() -> None:
-    """记录一个已知缺口（不修生产代码，先把它钉成断言）：
-
-    ``_IMAGE_WORDS`` 只认「生成一张 / 场景图 / 出图…」这类词，用户很自然的说法
-    「给主界面出一张背景图」不含任何关键词 → 预判为空，模型又回到自己翻仓库找脚本的老路。
-    修的时候应当往 ``_IMAGE_WORDS`` 补「出一张 / 背景图 / 配图」，这条断言会随之变红，
-    提醒同步更新。
-    """
-    assert Orchestrator._intent_hint("给主界面出一张背景图") == ""
+    assert {"read_file", "grep", "glob", "list_dir", "web_search",
+            "report_to_user"} <= READONLY_TOOLS
+    assert READONLY_TOOLS <= set(ROLE_TOOLS["main"])
+    assert not (READONLY_TOOLS & {
+        "write_file", "edit_file", "delete_file", "run_command",
+        "start_service", "stop_service", "spawn_agents",
+    })
 
 
 def test_plan_and_ask_hints() -> None:
@@ -188,11 +183,10 @@ def test_execute_run_end_to_end(session_factory) -> None:
         await orch.execute_run(ids["run_id"])
         run = await svcs.repo.get_run(ids["run_id"])
         messages = await svcs.repo.list_messages(ids["session_id"])
-        artifacts = await svcs.repo.list_artifacts(ids["run_id"])
         events = await svcs.repo.get_events_since(ids["run_id"], 0)
-        return ids, run, messages, artifacts, events
+        return ids, run, messages, events
 
-    ids, run, messages, artifacts, events = _run(_flow(), timeout=RUN_TIMEOUT_S)
+    ids, run, messages, events = _run(_flow(), timeout=RUN_TIMEOUT_S)
 
     assert run is not None
     assert run.status == "succeeded", f"run 未成功：status={run.status} error={run.error}"
@@ -203,12 +197,11 @@ def test_execute_run_end_to_end(session_factory) -> None:
     replies = [m for m in messages if m.author_type == "agent"]
     assert replies, "助手没有把回复落成消息（聊天流会是空的）"
 
-    kinds = {a.asset_kind for a in artifacts}
-    assert "image" in kinds, f"美术链没产出图片制品，实际：{kinds}"
-
     tool_calls = [e for e in events if e.type == "tool_call"]
     called = {str((e.payload_json or {}).get("tool")) for e in tool_calls}
-    assert {"write_file", "generate_image", "report_to_user"} <= called, called
+    assert {"write_file", "report_to_user"} <= called, called
+    assert not any(t.startswith("generate_") for t in called), \
+        f"团队版已移除媒体生成，却仍调用了：{called}"
 
     workspace = PROJECTS_ROOT / ids["repo_path"]
     assert (workspace / "feature_agent.py").exists(), "模型没把代码真的写进工作区"

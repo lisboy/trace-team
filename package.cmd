@@ -5,13 +5,17 @@ REM
 REM  Produces into  <repo>\dist_release\  :
 REM    * Trace-lite-win64-<ver>-<stamp>.zip     (no install; target needs Python)
 REM    * Trace-win64-exe-<ver>-<stamp>.zip      (single Trace.exe; zero install)
-REM    * Trace-lite-linux-<ver>-<stamp>.tar.gz  (needs bash, e.g. Git for Windows)
 REM  plus a .sha256 next to each archive.
 REM
-REM  Menu: [1] all three  [2] win lite  [3] win exe  [4] linux
-REM  It reuses packaging\windows-lite\build-package.ps1, packaging\exe\build-exe.ps1
-REM  and packaging\linux-lite\build-package.sh -- no logic is duplicated here.
-REM  The frontend is built once here, then the three builders run with -NoBuild.
+REM  The Linux team package (bundled Python + MariaDB) must be built on Linux.
+REM  Menu [4] builds it inside WSL when a WSL distro is installed (reuses the
+REM  frontend built above via --no-build); with no WSL it fails with instructions
+REM  instead of pretending to succeed. If dist\Trace-team-vcs-linux-x86_64.tar.gz
+REM  exists it also offers to build the one-click variant with offline git/svn.
+REM
+REM  Menu: [1] win lite + win exe  [2] win lite  [3] win exe  [4] linux (WSL)
+REM  It reuses packaging\windows-lite\build-package.ps1 and packaging\exe\build-exe.ps1
+REM  -- no logic is duplicated here. The frontend is built once, then builders run with -NoBuild.
 REM ============================================================================
 setlocal EnableExtensions
 cd /d "%~dp0"
@@ -23,13 +27,6 @@ set "OUT=%ROOT%\dist_release"
 if not exist "%OUT%" mkdir "%OUT%" >nul 2>&1
 
 set "VPY=%ROOT%\.venv\Scripts\python.exe"
-
-REM Prefer Git for Windows' bash; fall back to whatever bash is on PATH.
-set "BASH=C:\Program Files\Git\usr\bin\bash.exe"
-if not exist "%BASH%" (
-  set "BASH="
-  for /f "delims=" %%b in ('where bash 2^>nul') do if not defined BASH set "BASH=%%b"
-)
 
 if not exist "%ROOT%\game_agent" (
   echo [x] Put this script in the repository root, next to the game_agent\ folder.
@@ -49,16 +46,21 @@ if errorlevel 1 (
   goto fail
 )
 
+REM WSL is only needed for menu [4]; probe it once (no distro => wsl.exe errors out).
+set "WSL="
+wsl.exe -e uname -s >nul 2>&1
+if not errorlevel 1 set "WSL=1"
+
 :menu
 cls
 echo ============================================================
 echo   Trace - build distribution packages
 echo   output folder: %OUT%
 echo ------------------------------------------------------------
-echo   [1] All          win-lite zip + win-exe zip + linux tar.gz
+echo   [1] Windows packages   win-lite zip + win-exe zip
 echo   [2] Windows lite zip    (needs Python on target machine)
 echo   [3] Windows exe  zip    (single Trace.exe, zero install)
-echo   [4] Linux lite   tar.gz (needs bash / Git for Windows)
+echo   [4] Linux team package  (built inside WSL if installed)
 echo   [0] Quit
 echo ============================================================
 set "SEL="
@@ -73,7 +75,7 @@ goto menu
 :sel_all
 set "DO_WINLITE=1"
 set "DO_WINEXE=1"
-set "DO_LINUX=1"
+set "DO_LINUX="
 goto askbuild
 
 :sel_winlite
@@ -125,12 +127,19 @@ echo [checksum] writing .sha256 ...
 "%VPY%" "%ROOT%\packaging\checksums.py" "%OUT%"
 if errorlevel 1 set "RC=1"
 
+set "NART=0"
+for %%f in ("%OUT%\*.zip" "%OUT%\*.tar.gz") do set /a NART+=1
+if "%NART%"=="0" (
+  echo [!] No package archive was produced.
+  set "RC=1"
+)
+
 echo.
 echo ============================================================
 if "%RC%"=="0" (
   echo   BUILD OK
 ) else (
-  echo   BUILD FINISHED WITH ERRORS - see messages above
+  echo   BUILD FAILED - see messages above
 )
 echo   output folder: %OUT%
 echo ============================================================
@@ -179,20 +188,44 @@ goto :eof
 
 :do_linux
 echo.
-echo === [linux-lite] packaging ... ===
-if not exist "%BASH%" (
-  echo [!] bash not found - skipping the Linux package.
-  echo     Install Git for Windows, or build it on a Linux box:
-  echo        bash packaging/linux-lite/build-package.sh
-  exit /b 0
+echo === [linux-team] packaging (inside WSL) ... ===
+if not defined WSL goto linux_nowsl
+set "WROOT="
+for /f "usebackq delims=" %%p in (`wsl.exe wslpath -a "%ROOT%"`) do if not defined WROOT set "WROOT=%%p"
+set "WOUT="
+for /f "usebackq delims=" %%p in (`wsl.exe wslpath -a "%OUT%"`) do if not defined WOUT set "WOUT=%%p"
+if not defined WROOT (
+  echo [x] wslpath failed to map "%ROOT%" into WSL.
+  exit /b 1
 )
-REM Relative --out, combined with the `cd` above: bash starts with cwd = repo root,
-REM so the archive path is never "D:\..." (tar would read "D:" as a remote host).
-pushd "%ROOT%"
-"%BASH%" "packaging/linux-lite/build-package.sh" --out dist_release --no-build
-if errorlevel 1 (echo [x] linux-lite FAILED & popd & exit /b 1)
-popd
+echo     repo in WSL : %WROOT%
+echo     output      : %WOUT%
+echo     first build downloads Python runtime + MariaDB into packaging/linux-team/vendor
+set "VCSOPT="
+if not exist "%ROOT%\dist\Trace-team-vcs-linux-x86_64.tar.gz" goto vcs_done
+echo     found dist\Trace-team-vcs-linux-x86_64.tar.gz (offline git/svn)
+set "WV="
+set /p "WV=Also build the one-click package with offline git/svn? [y/N] : "
+if /i "%WV%"=="y" set "VCSOPT=--with-vcs"
+:vcs_done
+wsl.exe -e bash -lc "cd '%WROOT%' && bash packaging/linux-team/build-package.sh --out '%WOUT%' --no-build %VCSOPT%"
+if errorlevel 1 (
+  echo [x] linux-team FAILED - see the [build][x] line above.
+  exit /b 1
+)
 goto :eof
+
+:linux_nowsl
+echo [x] The Linux team package must be built on Linux, and this machine has no usable WSL distro.
+echo.
+echo     Option A - build here after a one-time install (needs admin, reboot may be required):
+echo        wsl --install -d Ubuntu
+echo     then double-click this script again and pick [4].
+echo.
+echo     Option B - no local Linux: push this repo and run the
+echo        "Linux team package" GitHub Actions workflow (Actions tab -^> Run workflow).
+echo     Nothing was built.
+exit /b 1
 
 :fail
 echo.

@@ -22,6 +22,9 @@ export default function DirPicker({
   const [dirs, setDirs] = useState<DirEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState("");
+  const [creating, setCreating] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [busyCreate, setBusyCreate] = useState(false);
 
   useEffect(() => {
     if (!open) return;
@@ -44,6 +47,7 @@ export default function DirPicker({
   function go(path: string) {
     setLoading(true);
     setErr("");
+    setCreating(false);
     api
       .fsDirs(path)
       .then((r: any) => {
@@ -53,6 +57,21 @@ export default function DirPicker({
       })
       .catch((e: any) => setErr(e?.message || "读取目录失败"))
       .finally(() => setLoading(false));
+  }
+
+  function mkdir() {
+    const name = newName.trim();
+    if (!name || !cur) return;
+    setBusyCreate(true);
+    setErr("");
+    api
+      .fsMkdir(cur, name)
+      .then((r: any) => {
+        setNewName("");
+        go(r?.path || cur);
+      })
+      .catch((e: any) => setErr(e?.message || "新建文件夹失败"))
+      .finally(() => setBusyCreate(false));
   }
 
   if (!open) return null;
@@ -67,14 +86,45 @@ export default function DirPicker({
         <div className="shrink-0 flex items-center gap-2 px-3 h-11 border-b border-slate-200 bg-slate-50">
           <span className="font-semibold text-sm text-slate-700">选择文件夹</span>
           <span className="text-[11px] text-slate-400 truncate flex-1" title={cur}>{cur || "…"}</span>
-          <button className="ga-btn ga-btn-ghost ga-btn-sm" onClick={() => go(parent || "")} disabled={!cur && !parent}>
+          <button className="ga-btn ga-btn-ghost ga-btn-sm" onClick={() => go(parent || "")} disabled={!parent}>
             上一级
+          </button>
+          <button
+            className="ga-btn ga-btn-ghost ga-btn-sm"
+            onClick={() => { setCreating((v) => !v); setErr(""); }}
+            disabled={!cur || loading}
+            title="在当前目录下新建一个空文件夹"
+          >
+            新建文件夹
           </button>
           <button className="ga-btn ga-btn-primary ga-btn-sm" onClick={() => onPick(cur)} disabled={!cur}>
             选择此文件夹
           </button>
           <button className="ga-btn ga-btn-secondary ga-btn-sm" onClick={onClose}>取消</button>
         </div>
+        {creating && (
+          <div className="shrink-0 flex items-center gap-2 px-3 py-2 border-b border-slate-200 bg-slate-50">
+            <input
+              autoComplete="off"
+              autoFocus
+              className="flex-1 min-w-0 border rounded px-2 py-1 text-xs"
+              placeholder="新文件夹名称"
+              value={newName}
+              disabled={busyCreate}
+              onChange={(e) => setNewName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") mkdir();
+                if (e.key === "Escape") setCreating(false);
+              }}
+            />
+            <button className="ga-btn ga-btn-primary ga-btn-sm" onClick={mkdir} disabled={busyCreate || !newName.trim()}>
+              {busyCreate ? "创建中…" : "创建"}
+            </button>
+            <button className="ga-btn ga-btn-secondary ga-btn-sm" onClick={() => setCreating(false)} disabled={busyCreate}>
+              取消
+            </button>
+          </div>
+        )}
         <div className="flex-1 overflow-auto p-1.5">
           {err && <div className="text-xs text-rose-600 px-2 py-1">{err}</div>}
           {loading && <div className="text-xs text-slate-400 px-2 py-1">读取中…</div>}
@@ -95,7 +145,7 @@ export default function DirPicker({
           ))}
         </div>
         <div className="shrink-0 px-3 py-1.5 border-t border-slate-200 bg-slate-50 text-[11px] text-slate-400">
-          单击文件夹进入，双击或点右上角「选择此文件夹」使用当前目录；也支持直接选择磁盘根目录。
+          单击文件夹进入，双击或点右上角「选择此文件夹」使用当前目录；也能在这里新建空文件夹。
         </div>
       </div>
     </div>,

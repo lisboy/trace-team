@@ -20,11 +20,12 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
-from game_agent.api.deps import _u, get_current_context, require
+from game_agent.api.deps import (_u, get_current_context, is_admin_role, owns_session,
+                                 require, require_chat)
 from game_agent.api.state import state
 from game_agent.agents.roles import ROLE_LABELS
 from game_agent.auth.rbac import PERM_RUN_CREATE, PERM_VIEW
@@ -251,7 +252,7 @@ async def _authorized_session(s: AsyncSession, session_id: str, ctx: RequestCont
     except ValueError:
         raise HTTPException(status_code=404, detail="会话不存在") from None
     sess = await s.get(Session, sid)
-    if (sess is None or str(sess.team_id) != ctx.team_id
+    if (sess is None or str(sess.team_id) != ctx.team_id or not owns_session(ctx, sess.created_by)
             or str(sess.project_id) not in ctx.project_ids or sess.status == "deleted"
             or (project_id is not None and str(sess.project_id) != project_id)):
         raise HTTPException(status_code=404, detail="会话不存在")
@@ -381,7 +382,7 @@ async def upload_project_file(project_id: str, file: UploadFile,
 
 @router.post("/projects/{project_id}/chat")
 async def chat(project_id: str, body: ChatIn, request: Request,
-               ctx: RequestContext = Depends(require(PERM_RUN_CREATE))):
+               ctx: RequestContext = Depends(require_chat())):
     async with SessionLocal() as s:
         ws = await _upload_workspace(s, project_id, ctx)
         sess = (await _authorized_session(s, body.session_id, ctx, project_id)
@@ -404,29 +405,20 @@ async def chat(project_id: str, body: ChatIn, request: Request,
             if old:
                 return {"run_id": str(old.id), "session_id": str(old.session_id),
                         "status": old.status, "dup": True}
-        # 会话权限作用域：未显式指定时，新会话取「设置」里的默认值
-        req_scope = None
-        if body.permission_scope is not None:
-            req_scope = policy_mod.normalize_scope(body.permission_scope)
+        # 团队版：助手行为固定「仅工作区」，body.permission_scope 一律忽略。
+        fixed_scope = policy_mod.DEFAULT_SCOPE
         if sess is None:
-            init_scope = req_scope
-            if init_scope is None:
-                try:
-                    init_scope = (await policy_mod.load_policy())["permission_scope"]
-                except Exception:  # noqa: BLE001 - 设置读不到就用安全默认
-                    init_scope = policy_mod.DEFAULT_SCOPE
             sess = Session(team_id=_u(ctx.team_id), project_id=_u(project_id),
                           title=body.content[:40] or ("（附件消息）" if files else "（图片消息）"),
                           created_by=_u(ctx.user_id),
                           skills_json=attached_skills,
-                          permission_scope=init_scope)
+                          permission_scope=fixed_scope)
             s.add(sess)
             await s.flush()
             await s.refresh(sess)
         if attached_skills is not None:
             sess.skills_json = attached_skills
-        if req_scope is not None:
-            sess.permission_scope = req_scope
+        sess.permission_scope = fixed_scope
         # 新消息即「最近活跃」：侧栏按这个时间排序/显示，后台一有新动作就能刷新出来
         sess.last_active = datetime.now(timezone.utc)
         meta = {}
@@ -445,24 +437,21 @@ async def chat(project_id: str, body: ChatIn, request: Request,
         await s.refresh(msg)
         run_opts: dict = {"caps": normalize_caps(body.caps),
                           "permission_scope": sess.permission_scope or policy_mod.DEFAULT_SCOPE}
-        if body.model_profile_key:
-            # 只接受本团队、kind=llm 的档位；乱传的 key 不让它静默回退到别的模型
-            from game_agent.db.models import ModelProfile
-            from sqlalchemy import select as _select
-            prof = await s.scalar(_select(ModelProfile).where(
-                ModelProfile.team_id == _u(ctx.team_id),
-                ModelProfile.key == body.model_profile_key,
-                ModelProfile.kind == "llm"))
-            if prof is None:
-                raise HTTPException(status_code=400, detail="所选模型档位不存在")
-            run_opts["model_profile_key"] = body.model_profile_key
-        if body.reasoning_effort:
-            if body.reasoning_effort not in ("none", "minimal", "low", "medium", "high"):
-                raise HTTPException(status_code=400, detail="推理等级不合法")
-            run_opts["reasoning_effort"] = body.reasoning_effort
+        # 团队版：对话里不能选模型。项目绑定哪个档位就用哪个（管理员在团队页配置）；
+        # 未绑定才回退角色默认。body 里的 model_profile_key / reasoning_effort 一律忽略，
+        # 避免前端旧版本或手工请求绕过项目模型。
+        proj = await s.get(Project, _u(project_id))
+        if proj is not None and proj.model_profile_key:
+            run_opts["model_profile_key"] = proj.model_profile_key
+        # 「需求」角色只读：无论前端传什么，都落成 analyze（不写代码、不建修改型任务）。
+        # 同时打上 readonly：orchestrator 据此把工具表硬裁成只读（写/跑/派发不可用），
+        # 不能只靠系统提示让模型「自觉不动手」。
+        is_viewer = ctx.role == "viewer"
+        if is_viewer:
+            run_opts["readonly"] = True
         run = Run(team_id=_u(ctx.team_id), project_id=_u(project_id), session_id=sess.id,
                   triggered_by=_u(ctx.user_id), trigger_msg_id=msg.id,
-                  run_type="analyze" if body.analyze else "modify",
+                  run_type="analyze" if (body.analyze or is_viewer) else "modify",
                   options_json=run_opts,
                   status="queued", idempotency_key=idem)
         s.add(run)
@@ -488,12 +477,17 @@ async def list_sessions(project_id: str, archived: bool = Query(False),
     status = "archived" if archived else "active"
     async with SessionLocal() as s:
         proj = await s.get(Project, _u(project_id))
-        if proj is None or str(proj.team_id) != ctx.team_id:
+        if (proj is None or str(proj.team_id) != ctx.team_id
+                or str(proj.id) not in ctx.project_ids):
             raise HTTPException(status_code=404, detail="项目不存在")
         if proj.archived_at is not None:
             return []
+        # 会话按账号隔离：列表只回自己的；没有 created_by 的历史会话只给管理员看
+        owner = Session.created_by == _u(ctx.user_id)
+        if is_admin_role(ctx.role):
+            owner = or_(owner, Session.created_by.is_(None))
         rows = await s.execute(select(Session).where(
-            Session.project_id == _u(project_id), Session.status == status
+            Session.project_id == _u(project_id), Session.status == status, owner
         ).order_by(Session.last_active.desc()))
         sessions = list(rows.scalars().all())
         busy_ids: set[str] = set()
@@ -510,6 +504,13 @@ async def list_sessions(project_id: str, archived: bool = Query(False),
                  "last_active": str(x.last_active or x.created_at)} for x in sessions]
 
 
+# 主对话角色的 key：已归并成 main，旧数据里可能还是 planner/artist/voice。
+# 子agent（spawn_agents 派出的只读调研，agent_key='sub'）**不属于主对话**，
+# 会话顶栏与上下文占用一律只认这几个 key（用户 2026-11-16 要求：子和主分开，
+# 顶栏只统计主的，子的在运行面板的「子agent」标签里单独看）。
+MAIN_AGENT_KEYS = ("main", "planner", "artist", "voice")
+
+
 @router.get("/sessions/{session_id}/usage")
 async def session_usage(session_id: str, ctx: RequestContext = Depends(require(PERM_VIEW))):
     """会话级用量：总 token / 缓存命中率 / 生成速度 + 上下文窗口占用（是否该压缩了）。
@@ -517,11 +518,18 @@ async def session_usage(session_id: str, ctx: RequestContext = Depends(require(P
     数据源 llm_calls（每次 LLM 往返即时落库，含 cached_tokens），按会话聚合该会话所有 run。
     上下文占用取每个角色「最近一次往返的 prompt_tokens」——那就是模型这次真正看到的
     上下文大小（压缩后），拿它比窗口即可判断离裁剪阈值还有多远。
+
+    **口径（2026-11-16 用户要求）**：这里的每个字段都只统计**主对话**（agent_key in
+    MAIN_AGENT_KEYS）。子agent 的 token/调用次数/动作不计入本接口的任何总量，
+    它们的账在 `GET /sessions/{id}/subagents` 里逐个子agent 单独看，
+    前端运行面板的「子agent」标签就是那份清单。
     """
     async with SessionLocal() as s:
-        sess = await s.get(Session, _u(session_id))
-        if sess is None or str(sess.team_id) != ctx.team_id:
-            raise HTTPException(status_code=404, detail="会话不存在")
+        sess = await _authorized_session(s, session_id, ctx)
+        # 主对话过滤条件：agent_key 落库为 main（旧行可能是 planner/artist/voice）；
+        # NULL 也归主对话（极早期数据没有 agent_key 列）。
+        main_only = or_(LlmCall.agent_key.is_(None),
+                        LlmCall.agent_key.in_(MAIN_AGENT_KEYS))
         row = (await s.execute(
             select(func.count(),
                    func.coalesce(func.sum(LlmCall.prompt_tokens), 0),
@@ -531,13 +539,22 @@ async def session_usage(session_id: str, ctx: RequestContext = Depends(require(P
                    func.coalesce(func.sum(LlmCall.cache_reported), 0))
             .select_from(LlmCall)
             .join(Run, Run.id == LlmCall.run_id)
-            .where(Run.session_id == sess.id))).one()
+            .where(Run.session_id == sess.id, main_only))).one()
         run_count = await s.scalar(
             select(func.count()).select_from(Run).where(Run.session_id == sess.id)) or 0
+        # 子agent 的条数/在跑数（只用于运行面板「子agent」标签上的小红点，
+        # 逐条明细走 /subagents）。本会话派过的所有只读 sub 任务，跨 run 累计。
+        sub_agg = (await s.execute(
+            select(func.count(),
+                   func.coalesce(func.sum(case((Task.status == "running", 1), else_=0)), 0))
+            .select_from(Task)
+            .join(Run, Run.id == Task.run_id)
+            .where(Run.session_id == sess.id, Task.agent_key == "sub"))).one()
+        sub_count, sub_running = int(sub_agg[0] or 0), int(sub_agg[1] or 0)
         # 会话累计「动作」：顶栏那条「运行了 N 条命令，读取了 N 个文件…」的会话级版本。
         # 分桶口径与前端 RunTraceInline.actionSummary 一致，两边数出来必须对得上。
-        # 直接聚合 events 的 tool_call（实测 4.7k 事件的会话 11ms），所以并进 /usage
-        # 一次带回，不另开接口、也不建缓存表。
+        # 子agent 产生的 tool_call 不计（顶栏只统计主对话）：events 挂在 task 上，
+        # 子agent 的 task.agent_key='sub'，outerjoin 后按它过滤，无 task 的旧事件保留。
         # 注意：SQLite 没有 json_unquote，会报 no such function。
         # 所以「取原始 JSON 文本再在 Python 里剥引号」（_plain_json），语义一致。
         tool_rows = (await s.execute(
@@ -545,7 +562,9 @@ async def session_usage(session_id: str, ctx: RequestContext = Depends(require(P
                    func.count())
             .select_from(Event)
             .join(Run, Run.id == Event.run_id)
-            .where(Run.session_id == sess.id, Event.type == "tool_call")
+            .outerjoin(Task, Task.id == Event.task_id)
+            .where(Run.session_id == sess.id, Event.type == "tool_call",
+                   or_(Event.task_id.is_(None), Task.agent_key != "sub"))
             .group_by(func.json_extract(Event.payload_json, "$.tool")))).all()
         run_span = (await s.execute(
             select(Run.created_at, Run.finished_at, Run.status)
@@ -564,7 +583,7 @@ async def session_usage(session_id: str, ctx: RequestContext = Depends(require(P
                    LlmCall.cached_tokens, LlmCall.cache_reported)
             .select_from(LlmCall)
             .join(Run, Run.id == LlmCall.run_id)
-            .where(Run.session_id == sess.id, LlmCall.purpose != "summarize")
+            .where(Run.session_id == sess.id, LlmCall.purpose != "summarize", main_only)
             .order_by(LlmCall.created_at.desc(), LlmCall.id.desc())
             .limit(500))).all()
         # 每个角色「最近一次调用」所在 run 的档位覆盖（输入框选过模型 / 运行中切换过）：
@@ -584,17 +603,25 @@ async def session_usage(session_id: str, ctx: RequestContext = Depends(require(P
                 pk = str((opts_by_run.get(rid) or {}).get("model_profile_key") or "").strip()
                 if pk:
                     override_keys[agent_key] = pk
-        # 角色 → 绑定的档位（含窗口参数）
+        # 角色 → 绑定的档位（含窗口参数）。项目覆盖优先：同名 key 两行时取项目行。
         agents_cfg = (await s.execute(
-            select(Agent).where(Agent.team_id == sess.team_id))).scalars().all()
+            select(Agent).where(Agent.team_id == sess.team_id,
+                                or_(Agent.project_id.is_(None),
+                                    Agent.project_id == sess.project_id)))).scalars().all()
         pkeys = {a.model_profile_key for a in agents_cfg if a.model_profile_key}
         # 运行档位（输入框选过模型）也要一起取：窗口按实际压缩用的档位算
         pkeys |= set(override_keys.values())
-        profiles = {}
+        profiles: dict[str, ModelProfile] = {}
         if pkeys:
-            profiles = {p.key: p for p in (await s.execute(
-                select(ModelProfile).where(ModelProfile.team_id == sess.team_id,
-                                           ModelProfile.key.in_(pkeys)))).scalars().all()}
+            for p in (await s.execute(
+                    select(ModelProfile).where(ModelProfile.team_id == sess.team_id,
+                                               ModelProfile.key.in_(pkeys),
+                                               or_(ModelProfile.project_id.is_(None),
+                                                   ModelProfile.project_id == sess.project_id))
+            )).scalars().all():
+                cur = profiles.get(p.key)
+                if cur is None or (p.project_id and not cur.project_id):
+                    profiles[p.key] = p
         # 供应商模型目录（窗口/视觉在这里按模型名配）：档位 params 缺省时从这里补齐，
         # 保证显示层读到的窗口与运行时（orchestrator._load_profile）完全一致。
         providers_by_id: dict[str, LlmProvider] = {}
@@ -611,6 +638,9 @@ async def session_usage(session_id: str, ctx: RequestContext = Depends(require(P
     # 瞬时速度：最近一次正文往返的「输出 token / 该轮耗时」。用户 2026-11-12 实测：
     # 切到更快的模型后顶栏还显示 21.7 tok/s（会话平均值被历史拖住），以为切换没生效。
     # 顶栏「速度」显示这个瞬时值；累计平均留在 tooltip 里备份对照。
+    # 2026-11-16：recent 已在 SQL 层过滤成主对话（见上面的 main_only），所以
+    # recent[0] 就是「主对话最近一轮」——子agent 的往返根本不在这个列表里，
+    # 不会再出现「顶栏速度变成子agent 那次调研的读数」。
     last_call = recent[0] if recent else None
     instant_speed = None
     if last_call is not None:
@@ -654,7 +684,11 @@ async def session_usage(session_id: str, ctx: RequestContext = Depends(require(P
         # usage 上报」的异常行后再求和，否则按角色的合计会比会话总量还大。
         st["rows"].append((int(pt or 0), int(_cached or 0), int(_ct or 0), bool(_rep)))
 
-    cfg_by_key = {a.key: a for a in agents_cfg}
+    cfg_by_key: dict[str, Agent] = {}
+    for a in agents_cfg:
+        cur = cfg_by_key.get(a.key)
+        if cur is None or (a.project_id and not cur.project_id):
+            cfg_by_key[a.key] = a
     by_agent = []
     for key, st in stats.items():
         cfg = cfg_by_key.get(key)
@@ -702,7 +736,9 @@ async def session_usage(session_id: str, ctx: RequestContext = Depends(require(P
             # 端点上报异常（累计值）的轮数；非 0 说明这个比例的参考意义下降
             "skewed_usage_calls": skewed,
         })
-    # 头条取占用比例最高的角色——它才是「这个会话离压缩还有多远」的答案
+    # 头条取占用比例最高的角色——它才是「这个会话离压缩还有多远」的答案。
+    # by_agent 里现在只有主对话角色（SQL 层已过滤掉 agent_key='sub'），
+    # 所以直接取第一条即可；子agent 的上下文在 /subagents 接口里单独看。
     by_agent.sort(key=lambda x: -x["used_pct"])
     context = by_agent[0] if by_agent else None
 
@@ -717,6 +753,13 @@ async def session_usage(session_id: str, ctx: RequestContext = Depends(require(P
         # 这个加法关系在界面上能自己核对，而不是只给一个百分比让人猜分母。
         "uncached_tokens": max(0, prompt - cached),
         "total_tokens": total,            # 总消耗 token = 输入 + 输出
+        # 注意：本接口所有数字**都不含子agent**（用户 2026-11-16 要求：子和主分开算，
+        # 顶栏只统计主的）。子agent 的逐条明细在 GET /sessions/{id}/subagents，
+        # 前端运行面板的「子agent」标签显示那份；这里只回一个总数让标签能显示条数。
+        "subagents": {
+            "count": int(sub_count or 0),
+            "running": int(sub_running or 0),
+        },
         "latency_ms": latency,
         # tokens_per_sec = 瞬时速度（最近一轮往返）；换模型后下一个思考轮次就会变。
         # tokens_per_sec_avg = 会话累计平均（全历史、含重试），只作对照，别再拿来当主显示。
@@ -755,6 +798,101 @@ async def session_usage(session_id: str, ctx: RequestContext = Depends(require(P
     }
 
 
+@router.get("/sessions/{session_id}/subagents")
+async def session_subagents(session_id: str, ctx: RequestContext = Depends(require(PERM_VIEW))):
+    """本会话所有跑过的子agent（spawn_agents 派出的只读调研）清单。
+
+    用户 2026-11-16 要求：「子和主的统计分开，这里只统计主的，子的在子里面看，
+    而且运行面板里要有单独 tab 看到这个会话所有运行过的子agent」。
+    所以顶栏 /usage 一律只算主对话，这份清单是子agent 唯一的出口。
+
+    数据源是两个表，各自没有对方的列，只能按「同一个 run」对齐：
+    - tasks：每个子agent 一条（kind/agent_key='sub'、title='子agent · 名字'、
+      result_json.question、status、started_at/finished_at → 耗时）；
+    - llm_calls：按 run_id + agent_key='sub' 聚合出 token/调用次数。
+      **注意**：llm_calls 没有 task_id，所以同一个 run 里并行派了 N 个子agent 时，
+      token 只能算到「这条 run 的子agent 合计」，不能精确拆到每个子agent 头上。
+      接口如实返回 run 级合计（sub_run_tokens），前端按 run 归组显示，不假造逐条数字。
+    """
+    async with SessionLocal() as s:
+        sess = await _authorized_session(s, session_id, ctx)
+        rows = (await s.execute(
+            select(Task.id, Task.run_id, Task.title, Task.status, Task.result_json,
+                   Task.cancel_requested, Task.created_at, Task.started_at, Task.finished_at,
+                   Run.created_at)
+            .select_from(Task)
+            .join(Run, Run.id == Task.run_id)
+            .where(Run.session_id == sess.id, Task.agent_key == "sub")
+            .order_by(Task.created_at.desc())
+            .limit(500))).all()
+        # 每条 run 里子agent 的 token 合计（含 prompts/completion）
+        run_ids = {str(r[1]) for r in rows if r[1]}
+        run_tok: dict[str, dict] = {}
+        if run_ids:
+            for rid, n, pt, ct, ms in (await s.execute(
+                    select(LlmCall.run_id, func.count(),
+                           func.coalesce(func.sum(LlmCall.prompt_tokens), 0),
+                           func.coalesce(func.sum(LlmCall.completion_tokens), 0),
+                           func.coalesce(func.sum(LlmCall.latency_ms), 0))
+                    .where(LlmCall.run_id.in_([_u(x) for x in run_ids]),
+                           LlmCall.agent_key == "sub")
+                    .group_by(LlmCall.run_id))).all():
+                run_tok[str(rid)] = {"calls": int(n or 0), "prompt_tokens": int(pt or 0),
+                                     "completion_tokens": int(ct or 0),
+                                     "total_tokens": int(pt or 0) + int(ct or 0),
+                                     "latency_ms": int(ms or 0)}
+    items = []
+    for (tid, rid, title, status, rj, cancelled, created, started, finished,
+         run_created) in rows:
+        started = started or created
+        end = finished or datetime.now(timezone.utc)
+        try:
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+            if end.tzinfo is None:
+                end = end.replace(tzinfo=timezone.utc)
+            elapsed_ms = max(0, int((end - started).total_seconds() * 1000))
+        except Exception:  # noqa: BLE001 - 时间异常不该让整份清单 500
+            elapsed_ms = 0
+        question = ""
+        error = None
+        summary = None
+        if isinstance(rj, dict):
+            question = str(rj.get("question") or "")
+            error = rj.get("error")
+            # 老 run 的 task_done 事件没带 summary，结论只落在 result_json.text 里：
+            # 弹窗要能显示「它最后得出了什么」，这里一并回给前端做兜底
+            text = rj.get("text")
+            if isinstance(text, str) and text.strip():
+                summary = text
+        items.append({
+            "task_id": str(tid),
+            "run_id": str(rid),
+            "run_created_at": str(run_created) if run_created else None,
+            # title 形如「子agent · 核对XX」，去掉前缀留给人看的名字
+            "name": (title or "子agent").replace("子agent · ", ""),
+            "question": question,
+            "status": status,
+            "cancel_requested": bool(cancelled),
+            "error": str(error) if error else None,
+            # 结论兜底：事件流里没有 task_done.summary 的老 run 也能在弹窗里看到
+            "summary": summary,
+            "created_at": str(created),
+            "started_at": str(started) if started else None,
+            "finished_at": str(finished) if finished else None,
+            "elapsed_ms": elapsed_ms,
+            "run_usage": run_tok.get(str(rid)),
+        })
+    totals = {"count": len(items),
+              "running": sum(1 for x in items if x["status"] == "running"),
+              "failed": sum(1 for x in items if x["status"] == "failed"),
+              "calls": sum(v["calls"] for v in run_tok.values()),
+              "prompt_tokens": sum(v["prompt_tokens"] for v in run_tok.values()),
+              "completion_tokens": sum(v["completion_tokens"] for v in run_tok.values())}
+    totals["total_tokens"] = totals["prompt_tokens"] + totals["completion_tokens"]
+    return {"session_id": str(sess.id), "totals": totals, "items": items}
+
+
 @router.get("/sessions/{session_id}/context-stats")
 async def session_context_stats(
     session_id: str,
@@ -771,10 +909,11 @@ async def session_context_stats(
     run_id 非空时只统计这条 run（运行面板用）；留空则是整个会话的趋势。
     """
     async with SessionLocal() as s:
-        sess = await s.get(Session, _u(session_id))
-        if sess is None or str(sess.team_id) != ctx.team_id:
-            raise HTTPException(status_code=404, detail="会话不存在")
-        cond = [Run.session_id == sess.id, LlmTranscript.purpose == "agent"]
+        sess = await _authorized_session(s, session_id, ctx)
+        cond = [Run.session_id == sess.id, LlmTranscript.purpose == "agent",
+                # 只统计主对话（子agent 的往返在「子agent」标签里单独看，2026-11-16）
+                or_(LlmTranscript.agent_key.is_(None),
+                    LlmTranscript.agent_key.in_(MAIN_AGENT_KEYS))]
         if run_id:
             cond.append(LlmTranscript.run_id == _u(run_id))
         rows = (await s.execute(
@@ -807,14 +946,22 @@ async def session_context_stats(
                                    .where(LlmCall.call_id.in_(call_ids)))).all()
             real_by_call = {cid: int(pt or 0) for cid, pt in got}
         agents_cfg = (await s.execute(
-            select(Agent).where(Agent.team_id == sess.team_id))).scalars().all()
+            select(Agent).where(Agent.team_id == sess.team_id,
+                                or_(Agent.project_id.is_(None),
+                                    Agent.project_id == sess.project_id)))).scalars().all()
         pkeys = {a.model_profile_key for a in agents_cfg if a.model_profile_key}
         pkeys |= override_keys
-        profiles = {}
+        profiles: dict[str, ModelProfile] = {}
         if pkeys:
-            profiles = {p.key: p for p in (await s.execute(
-                select(ModelProfile).where(ModelProfile.team_id == sess.team_id,
-                                           ModelProfile.key.in_(pkeys)))).scalars().all()}
+            for p in (await s.execute(
+                    select(ModelProfile).where(ModelProfile.team_id == sess.team_id,
+                                               ModelProfile.key.in_(pkeys),
+                                               or_(ModelProfile.project_id.is_(None),
+                                                   ModelProfile.project_id == sess.project_id))
+            )).scalars().all():
+                cur = profiles.get(p.key)
+                if cur is None or (p.project_id and not cur.project_id):
+                    profiles[p.key] = p
         # 与 /usage 同源：供应商模型目录按模型名补齐档位缺省的窗口/视觉。
         providers_by_id: dict[str, LlmProvider] = {}
         if pkeys:
@@ -837,7 +984,11 @@ async def session_context_stats(
             .where(*cond2))).all()
     summarize_est = sum(int((r[0] or {}).get("est_prompt_tokens") or 0) for r in summ)
 
-    cfg_by_key = {a.key: a for a in agents_cfg}
+    cfg_by_key: dict[str, Agent] = {}
+    for a in agents_cfg:
+        cur = cfg_by_key.get(a.key)
+        if cur is None or (a.project_id and not cur.project_id):
+            cfg_by_key[a.key] = a
 
     def occupancy(agent_key: str | None, used: int, run_id: str | None = None) -> dict:
         """把「这一轮发出去多少 token」换成「窗口占用百分之几、该不该压缩」。
@@ -929,7 +1080,6 @@ async def session_context_stats(
 
 class SessionStatusIn(BaseModel):
     status: str | None = None  # active|archived（可选，不再强制）
-    permission_scope: str | None = None  # workspace|full（可选）
 
 
 @router.patch("/sessions/{session_id}")
@@ -937,19 +1087,12 @@ async def update_session(session_id: str, body: SessionStatusIn,
                          ctx: RequestContext = Depends(require(PERM_RUN_CREATE))):
     if body.status is not None and body.status not in ("active", "archived"):
         raise HTTPException(status_code=400, detail="status 只能为 active 或 archived")
-    if body.permission_scope is not None and \
-            policy_mod.normalize_scope(body.permission_scope, "") != body.permission_scope:
-        raise HTTPException(status_code=400, detail="permission_scope 只能为 workspace 或 full")
-    if body.status is None and body.permission_scope is None:
+    if body.status is None:
         raise HTTPException(status_code=400, detail="没有要修改的字段")
     async with SessionLocal() as s:
-        sess = await s.get(Session, _u(session_id))
-        if sess is None or str(sess.team_id) != ctx.team_id or sess.status == "deleted":
-            raise HTTPException(status_code=404, detail="会话不存在")
+        sess = await _authorized_session(s, session_id, ctx)
         if body.status is not None:
             sess.status = body.status
-        if body.permission_scope is not None:
-            sess.permission_scope = policy_mod.normalize_scope(body.permission_scope)
         await s.commit()
         return {"id": str(sess.id), "status": sess.status,
                 "permission_scope": sess.permission_scope or policy_mod.DEFAULT_SCOPE}
@@ -959,9 +1102,7 @@ async def update_session(session_id: str, body: SessionStatusIn,
 async def delete_session(session_id: str, ctx: RequestContext = Depends(require(PERM_RUN_CREATE))):
     """软删：保留消息与 run 关联，列表不再展示。"""
     async with SessionLocal() as s:
-        sess = await s.get(Session, _u(session_id))
-        if sess is None or str(sess.team_id) != ctx.team_id or sess.status == "deleted":
-            raise HTTPException(status_code=404, detail="会话不存在")
+        sess = await _authorized_session(s, session_id, ctx)
         sess.status = "deleted"
         await s.commit()
     return {"ok": True}
@@ -978,9 +1119,7 @@ async def session_runs(session_id: str, limit: int = Query(30, ge=1, le=200),
     这里按会话查，永远查得到。
     """
     async with SessionLocal() as s:
-        sess = await s.get(Session, _u(session_id))
-        if sess is None or str(sess.team_id) != ctx.team_id:
-            raise HTTPException(status_code=404, detail="会话不存在")
+        sess = await _authorized_session(s, session_id, ctx)
         rows = (await s.execute(
             select(Run).where(Run.session_id == sess.id)
             .order_by(Run.created_at.desc()).limit(limit))).scalars().all()
@@ -1151,9 +1290,7 @@ async def export_session(session_id: str, ctx: RequestContext = Depends(require(
     排查上下文问题的巨型原始报文，走运行面板单条看即可。
     """
     async with SessionLocal() as s:
-        sess = await s.get(Session, _u(session_id))
-        if sess is None or str(sess.team_id) != ctx.team_id:
-            raise HTTPException(status_code=404, detail="会话不存在")
+        sess = await _authorized_session(s, session_id, ctx)
         proj = await s.get(Project, sess.project_id)
         msgs = (await s.execute(select(Message).where(
             Message.session_id == sess.id).order_by(Message.created_at))).scalars().all()

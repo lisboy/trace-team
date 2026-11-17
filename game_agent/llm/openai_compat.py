@@ -23,11 +23,11 @@ import httpx
 
 from game_agent.config import (
     LLM_CONNECT_TIMEOUT_S, LLM_MAX_CONCURRENCY, LLM_MODEL, LLM_PARALLEL_TOOL_CALLS,
-    LLM_RETRY_BASE_S, LLM_USER_AGENT, OPENAI_API_KEY, OPENAI_BASE_URL,
+    LLM_RETRY_BASE_S, LLM_USER_AGENT,
 )
 from game_agent.llm.base import (
-    Ctx, LLM, LLMResponse, LlmAuthError, LlmContextOverflow, LlmPayloadTooLarge,
-    ToolCall, ToolSpec, parse_tool_arguments,
+    Ctx, LLM, LLMResponse, LlmAuthError, LlmBadEndpoint, LlmContextOverflow,
+    LlmPayloadTooLarge, ToolCall, ToolSpec, parse_tool_arguments,
 )
 from game_agent.llm.context_window import (
     BUDGET_RATIO, MEDIA_BYTES_BUDGET, compress_messages, fit_media, media_stats,
@@ -122,6 +122,21 @@ def _is_waf_response(status: int, headers, raw: str) -> bool:
     return ("just a moment" in low or "cf-chl" in low
             or "challenge-platform" in low
             or "<!doctype html" in low or "<html" in low)
+
+
+def _decode_body(raw: bytes, charset: str | None = None) -> str:
+    """错误响应体解码：优先响应头声明的 charset，其次 utf-8，最后 gb18030。
+
+    国内网关的错误页常见「头里写 utf-8、正文却是 GBK」，httpx 的 resp.text 会
+    解成 ``□□``，报错里最关键的中文原因就丢了。"""
+    for enc in (charset, "utf-8", "gb18030"):
+        if not enc:
+            continue
+        try:
+            return raw.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("utf-8", "replace")
 
 
 class _ContentPartsUnsupported(RuntimeError):
@@ -502,6 +517,16 @@ def _classify_http_error(status: int, raw: str,
     「是哪个端点、哪个模型、哪把 key」——多档位/多供应商并存时这是最快的定位依据。
     """
     h = f"（{hint}）" if hint else ""
+    if 300 <= status < 400:
+        # 302/301：地址跳走了。OpenAI 兼容端点不会正常重定向，命中基本意味着
+        # Base URL 填错（少了 /v1、填了网站首页/登录页）。重试没有意义：同一次
+        # 失败会连撞 5 次，用户只看到一串「连接失败」。
+        snippet = f"（响应：{raw[:120]}）" if raw and "<" not in raw[:200] else ""
+        return LlmBadEndpoint(
+            f"LLM 端点返回 {status} 重定向{h}：这不是模型接口的响应，"
+            "通常是 Base URL 填错（OpenAI 兼容地址应形如 https://host/v1，"
+            "或该网关要求的完整前缀），也可能被网关跳到了登录/验证页。"
+            f"本次不重试，请到「设置 → 模型配置」订正 Base URL。{snippet}")
     if status in (401, 403):
         return LlmAuthError(
             f"LLM 端点拒绝访问（HTTP {status}）：请检查 API Key 与账户额度{h}。{raw[:200]}")
@@ -521,6 +546,11 @@ def _classify_http_error(status: int, raw: str,
                                                    "not permitted", "unrecognized",
                                                    "additional propert", "invalid")):
                 return _UnknownFieldRejected(f"HTTP {status}: {raw[:300]}", f)
+    if status in (404, 405):
+        # 404/405 同样是「地址或模型名不对」的确定性错误：重试只会把同一条错误再打 4 次。
+        return LlmBadEndpoint(
+            f"LLM 端点返回 HTTP {status}{h}：地址或模型名不对（常见是 Base URL 少了 /v1，"
+            f"或模型名在该网关不存在）。本次不重试。{raw[:300]}")
     if status in _RETRYABLE_STATUS:
         return _RetryableLLMError(f"HTTP {status}: {raw[:200]}", retry_after, status=status)
     return RuntimeError(f"LLM HTTP {status}: {raw[:500]}")
@@ -567,8 +597,9 @@ class OpenAICompatibleLLM(LLM):
                  max_tokens: int = 0) -> None:
         self.role = role
         self.model = model or LLM_MODEL
-        self.api_key = api_key or OPENAI_API_KEY
-        self.base_url = (base_url or OPENAI_BASE_URL).rstrip("/")
+        # 端点与 Key 只来自绑定的模型档位（factory 已校验），不存在 .env 全局兜底。
+        self.api_key = api_key or ""
+        self.base_url = (base_url or "").rstrip("/")
         self.context_window = context_window
         self.vision = vision
         # 推理强度（模型档位 params_json.reasoning_effort）：""=不传走端点默认；
@@ -686,10 +717,11 @@ class OpenAICompatibleLLM(LLM):
             raise self._net_error(e) from e
         if resp.status_code == 200:
             return resp
-        if _is_waf_response(resp.status_code, resp.headers, resp.text):
+        raw = _decode_body(resp.content or b"", resp.charset_encoding)
+        if _is_waf_response(resp.status_code, resp.headers, raw):
             raise _WafBlocked(f"被 Cloudflare 人机验证拦下（HTTP {resp.status_code}，"
                               f"不是 Key 问题）；入口={self.base_url}")
-        raise _classify_http_error(resp.status_code, resp.text,
+        raise _classify_http_error(resp.status_code, raw,
                                    resp.headers.get("retry-after"),
                                    hint=f"端点={self.base_url} 模型={self.model}")
 
@@ -892,8 +924,9 @@ class OpenAICompatibleLLM(LLM):
                             resp = await asyncio.wait_for(
                                 self._chat_stream(client, body, headers, on_delta, t0),
                                 timeout=call_timeout)
-                        except (LlmAuthError, LlmContextOverflow, LlmPayloadTooLarge,
-                                _ContentPartsUnsupported, _UnknownFieldRejected):
+                        except (LlmAuthError, LlmBadEndpoint, LlmContextOverflow,
+                                LlmPayloadTooLarge, _ContentPartsUnsupported,
+                                _UnknownFieldRejected):
                             raise
                         except _ProxyRefused:
                             # 代理连不上要交给外层「换直连」，别当成「流式不支持」降级
@@ -922,6 +955,9 @@ class OpenAICompatibleLLM(LLM):
                     gate.note_ok()
                     return resp
                 except LlmAuthError:
+                    raise
+                except LlmBadEndpoint:
+                    # 端点地址/模型名不对：同一次失败连撞 5 次只会让用户等更久
                     raise
                 except _ContentPartsUnsupported as e:
                     # 格式协商，不是请求内容有错：压成纯文本重发，且**不消费**重试次数。
@@ -1062,7 +1098,7 @@ class OpenAICompatibleLLM(LLM):
             if resp.status_code in (401, 403, 429, 503):
                 # 与非流式 _post_once 保持一致：把服务端返回的真实原因带出来，
                 # 否则排查时只能看到光秃秃的 "HTTP 403"，定位不到 INVALID_API_KEY / 额度等根因。
-                raw = (await resp.aread())[:2000].decode("utf-8", "ignore")
+                raw = _decode_body((await resp.aread())[:2000], resp.charset_encoding)
                 if _is_waf_response(resp.status_code, resp.headers, raw):
                     raise _WafBlocked(f"被 Cloudflare 人机验证拦下（HTTP {resp.status_code}，"
                                       f"不是 Key 问题）；入口={self.base_url}")
@@ -1072,9 +1108,10 @@ class OpenAICompatibleLLM(LLM):
             if resp.status_code != 200:
                 # 2000 而不是 200：pydantic 校验详情（content 类型错误）常常在 200 字符之后，
                 # 截太短会让「content parts 不兼容」识别不到，只能当普通 400 失败。
-                raw = (await resp.aread())[:2000].decode("utf-8", "ignore")
+                raw = _decode_body((await resp.aread())[:2000], resp.charset_encoding)
                 raise _classify_http_error(resp.status_code, raw,
-                                           resp.headers.get("retry-after"))
+                                           resp.headers.get("retry-after"),
+                                           hint=f"端点={self.base_url} 模型={self.model}")
             try:
                 async for line in resp.aiter_lines():
                     if not line.startswith("data:"):

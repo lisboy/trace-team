@@ -24,7 +24,7 @@ _FEATURE_TEST = "test_feature_agent.py"
 _DEMO_REASONING: dict[str, list[str]] = {
     "main": [
         "先看工程结构：这是卡牌游戏的 Python 工程，需求要落到可运行的代码上。",
-        "自己动手改：新增示例模块与测试，同时直接调 generate_image 出横幅图。",
+        "自己动手改：新增示例模块与测试。",
         "代码已写入，跑一遍 pytest 确认能过。",
         "全部验证通过，汇总改动与产物路径向用户汇报。",
     ],
@@ -84,11 +84,7 @@ def _build_report(ctx: Ctx) -> str:
         "**代码改动**（2 个文件，新增于独立分支）\n"
         f"| 文件 | 说明 |\n|---|---|\n| `{_FEATURE_MODULE}` | 新增示例功能模块 |\n"
         f"| `{_FEATURE_TEST}` | 新增单元测试 |\n\n"
-        "**新增素材（1 张，⚠️ 占位）**\n"
-        "- `assets/art/ui/ui_feature_banner_v1.png` — 512×256\n\n"
         "**验证证据**：`python -m pytest test_feature_agent.py -q` → 2 passed\n\n"
-        "**⚠️ 占位素材说明**：未配置图像供应商，到「供应商配置」填 key 后"
-        "在素材库「批量重画」，文件名不变，代码无需改动。\n\n"
         "**注意事项**：分支待合并，请 admin 审阅 diff。"
     )
 
@@ -136,9 +132,6 @@ class MockBrain(LLM):
             return LLMResponse(tool_calls=[
                 _tc("write_file", path=_FEATURE_MODULE, content=_feature_module(ctx.requirement)),
                 _tc("write_file", path=_FEATURE_TEST, content=_feature_test()),
-                _tc("generate_image", prompt="功能展示横幅，厚涂赛璐璐 冷色调",
-                    size="512x256", transparent=False, category="ui",
-                    slug="ui_feature_banner", count=1),
             ], usage=usage)
         if self._round == 3:
             return LLMResponse(tool_calls=[

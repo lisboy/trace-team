@@ -248,24 +248,32 @@ def _parse_json(text: str, max_body: int = MAX_BODY) -> list[dict[str, Any]] | N
 async def _main_profile(project_id: str) -> dict[str, Any]:
     """解析项目所属团队 main 角色绑定的 ModelProfile → Ctx.model_profile。
 
-    以前这里传空 ctx，build_llm 回退到环境变量默认端点（该订阅已失效时永远 403），
-    记忆融合就永远走 ``_fallback``，用户看到「没有把所有记忆重新融合成一份」。
-    取值链路与 orchestrator._load_profile 保持一致：Agent.model_profile_key → ModelProfile
-    → 供应商 base_url/api_key（档位 inline 优先）。
+    取值链路与 orchestrator._load_profile 保持一致：项目绑定档位 → Agent.model_profile_key
+    → ModelProfile → 供应商 base_url/api_key（档位 inline 优先）。取不到返回 {}，调用方
+    跳过融合（团队版没有 .env 全局兜底模型，不能退回环境变量）。
     """
     async with SessionLocal() as s:
         proj = await s.get(Project, _u(project_id))
         if proj is None:
             return {}
+        # 智能体与档位都按项目维度解析：项目覆盖 > 团队默认（与 get_agent_config 同口径）
         agent = await s.scalar(select(Agent).where(
-            Agent.team_id == proj.team_id, Agent.key == "main"))
-        profile_key = agent.model_profile_key if agent else None
+            Agent.team_id == proj.team_id, Agent.project_id == proj.id,
+            Agent.key == "main"))
+        base_agent = await s.scalar(select(Agent).where(
+            Agent.team_id == proj.team_id, Agent.project_id.is_(None), Agent.key == "main"))
+        profile_key = (proj.model_profile_key
+                       or (agent.model_profile_key if agent else None)
+                       or (base_agent.model_profile_key if base_agent else None))
         if not profile_key:
             return {}
-        p = await s.scalar(select(ModelProfile).where(
-            ModelProfile.team_id == proj.team_id, ModelProfile.key == profile_key))
+        q = select(ModelProfile).where(
+            ModelProfile.team_id == proj.team_id, ModelProfile.key == profile_key)
+        p = await s.scalar(q.where(ModelProfile.project_id == proj.id))
         if p is None:
-            log.warning("记忆融合：main 角色绑定的档位 key=%r 不存在，将回退环境默认", profile_key)
+            p = await s.scalar(q.where(ModelProfile.project_id.is_(None)))
+        if p is None:
+            log.warning("记忆融合：绑定的档位 key=%r 不存在，跳过本轮融合", profile_key)
             return {}
         params = p.params_json or {}
         base_url, api_key, user_agent = p.base_url, None, None

@@ -1,11 +1,16 @@
 import { useState } from "react";
-import { useAuth } from "../store";
-import { navigateKeep } from "../router";
+import { isAdminUser, useAuth } from "../store";
+import { navigate, navigateKeep } from "../router";
 import { notifyEnabled, setNotifyEnabled, notifyPermission } from "../notify";
 import Avatar from "./Avatar";
 
+const ROLE_LABEL: Record<string, string> = {
+  owner: "管理员", admin: "管理员", developer: "开发", viewer: "需求",
+};
+
 export default function Topbar() {
   const { user } = useAuth();
+  const isAdmin = isAdminUser(user);
   const [notifyOn, setNotifyOn] = useState(notifyEnabled());
   const [notifyPerm, setNotifyPerm] = useState(notifyPermission());
 
@@ -47,7 +52,7 @@ export default function Topbar() {
         <div className="ga-brand font-bold">循迹 Trace</div>
       </div>
 
-      {/* 个人版没有「团队」概念：工作区就是当前账号自己的，不做切换。 */}
+      {/* 团队版：工作区/成员/模型统一在「团队」页管理（仅管理员可见） */}
       <nav className="flex items-center gap-1 text-sm">
         <button
           className="px-2 py-1 rounded hover:bg-slate-100"
@@ -55,12 +60,23 @@ export default function Topbar() {
         >
           对话
         </button>
-        <button
-          className="px-2 py-1 rounded hover:bg-slate-100"
-          onClick={() => navigateKeep("assets")}
-        >
-          素材库
-        </button>
+        {isAdmin && (
+          <button
+            className="px-2 py-1 rounded hover:bg-slate-100"
+            onClick={() => navigateKeep("team")}
+          >
+            团队
+          </button>
+        )}
+        {isAdmin && (
+          <button
+            className="px-2 py-1 rounded hover:bg-slate-100"
+            onClick={() => navigate("config")}
+            title="团队设置：模型供应商、助手行为、技能、MCP、项目记忆、存储与日志"
+          >
+            设置
+          </button>
+        )}
         <button
           className="px-2 py-1 rounded hover:bg-slate-100"
           onClick={() => navigateKeep("usage")}
@@ -107,16 +123,20 @@ export default function Topbar() {
         <button
           className="flex items-center gap-2 rounded-full pl-2 pr-0.5 py-0.5 hover:bg-slate-100"
           onClick={() =>
-            window.dispatchEvent(new CustomEvent("ga-open-settings", { detail: { tab: "profile" } }))
+            window.dispatchEvent(new CustomEvent("ga-open-settings", {
+              detail: { tab: "profile", mode: "personal" },
+            }))
           }
-          title="个人设置（头像 / 名称 / 密码 / 外观 / 模型 / 项目记忆 / 系统日志）"
-          aria-label="打开设置"
+          title="个人设置（头像 / 名称 / 密码 / 外观）"
+          aria-label="打开个人设置"
         >
           <span className="text-slate-600 leading-tight text-right">
             <span className="block text-xs font-medium max-w-[140px] truncate">
               {user?.display_name || "未命名"}
             </span>
-            <span className="block text-[10px] text-slate-400">{user?.email || "未登录"}</span>
+            <span className="block text-[10px] text-slate-400">
+              {user?.username || ROLE_LABEL[user?.role || ""] || ""}
+            </span>
           </span>
           <Avatar src={user?.avatar} name={user?.display_name} size={28} className="ring-1 ring-slate-200" />
         </button>

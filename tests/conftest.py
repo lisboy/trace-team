@@ -27,6 +27,8 @@ os.environ["GA_DATA_DIR"] = str(_TMP)
 os.environ["PROJECTS_ROOT"] = str(_PROJECTS)
 os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{(_TMP / 'smoke.db').as_posix()}"
 os.environ["GA_SECRET_KEY"] = "smoke-test-secret-not-for-production"
+# 团队版默认要求登录；冒烟测试直接打 API，用免登录模式退回本机 owner 身份
+os.environ["GA_AUTH_DISABLED"] = "1"
 
 # ---- 大脑：测试用离线假大脑（零 key、零网络）----
 # 生产已彻底移除 mock 模式（永远走真实大模型）。冒烟测试仍需要一个不发网络请求的
@@ -38,7 +40,7 @@ os.environ["GA_SECRET_KEY"] = "smoke-test-secret-not-for-production"
 # **已存在**的环境变量，pop 掉的键会被仓库根目录 .env 重新填上（COMFYUI_BASE_URL 等），
 # MockBrain 冒烟测试就会真的去连本机 ComfyUI / TTS，180s 超时全红（实测踩过）。
 for _k in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "COMFYUI_BASE_URL", "TTS_BASE_URL",
-           "GA_ROLE_MODELS", "REDIS_URL"):
+           "GA_ROLE_MODELS"):
     os.environ[_k] = ""
 os.environ["PLACEHOLDER_ENABLED"] = "1"
 

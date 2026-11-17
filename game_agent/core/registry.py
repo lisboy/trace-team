@@ -1,7 +1,8 @@
-"""智能体注册表：团队级配置载入与初始化（设计 §4.1，配置粒度为团队级）。
+"""智能体注册表：团队级默认配置载入与初始化（设计 §4.1）。
 
 5 个角色都是同一个 AgentRuntime 的实例，差异来自 system prompt / 工具白名单 / 模型档位 / 参数。
-新增角色 = 插一行配置。
+团队默认行（project_id 为空）由 seed 建；项目可在设置里覆盖（project_id 非空），
+解析优先级：项目专属 → 团队默认 → 出厂。
 """
 from __future__ import annotations
 
@@ -64,11 +65,25 @@ def _uuid(v):  # type: ignore[no-untyped-def]
     return v
 
 
-async def get_agent_config(session: AsyncSession, team_id: str, key: str) -> AgentConfig:
-    row = await session.scalar(
-        select(Agent).where(Agent.team_id == _uuid(team_id), Agent.key == key)
+async def get_agent_config(session: AsyncSession, team_id: str, key: str,
+                           project_id: Optional[str] = None) -> AgentConfig:
+    """取角色的生效配置：项目专属行优先，未配置则回退团队默认（project_id 为空）。
+
+    项目行允许只覆盖部分字段（如只绑模型、不改提示词）——这里按字段回退：
+    模型绑定/参数取项目行非空值，提示词为空时用团队默认。
+    """
+    row = None
+    if project_id:
+        row = await session.scalar(
+            select(Agent).where(Agent.team_id == _uuid(team_id),
+                                Agent.project_id == _uuid(project_id),
+                                Agent.key == key)
+        )
+    base = await session.scalar(
+        select(Agent).where(Agent.team_id == _uuid(team_id),
+                            Agent.project_id.is_(None), Agent.key == key)
     )
-    if row is None:
+    if row is None and base is None:
         # 兜底：用默认（理论上 seed 已建）
         return AgentConfig(
             key=key,
@@ -77,10 +92,15 @@ async def get_agent_config(session: AsyncSession, team_id: str, key: str) -> Age
             model_profile_key=None,
             params_json={},
         )
+    params = dict((base.params_json if base else None) or {})
+    params.update((row.params_json if row else None) or {})
     return AgentConfig(
-        key=row.key,
-        system_prompt=row.system_prompt,
-        tool_whitelist=ROLE_TOOLS.get(row.key, []),
-        model_profile_key=row.model_profile_key,
-        params_json=row.params_json or {},
+        key=key,
+        system_prompt=((row.system_prompt if row else "") or
+                       (base.system_prompt if base else "") or
+                       ROLE_PROMPTS.get(key, "")),
+        tool_whitelist=ROLE_TOOLS.get(key, []),
+        model_profile_key=((row.model_profile_key if row else None) or
+                           (base.model_profile_key if base else None)),
+        params_json=params,
     )

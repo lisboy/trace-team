@@ -19,13 +19,15 @@ interface StorageInfo {
   pending_switch_to: string;
   /** 非空 = 数据目录被环境变量 GA_DATA_DIR 钉死，这里改不动（后端会拒绝迁移） */
   env_override_dir?: string;
+  /** 带内置数据库（Linux 包）：迁移会先停库再复制，期间界面暂时无响应 */
+  moves_local_db?: boolean;
   /** 「浏览…」能否弹系统原生窗口（false → 用内置目录浏览器） */
   picker_native?: boolean;
 }
 
 export interface MigrateProgress {
   running: boolean;
-  phase: "idle" | "scan" | "copy" | "db" | "done" | "error";
+  phase: "idle" | "scan" | "copy" | "stopdb" | "copydb" | "startdb" | "db" | "done" | "error";
   percent: number | null;
   done_human: string;
   total_human: string;
@@ -41,6 +43,9 @@ export interface MigrateProgress {
 const PHASE_LABEL: Record<string, string> = {
   scan: "正在统计要迁移的数据…",
   copy: "正在复制文件…",
+  stopdb: "正在停止内置数据库…",
+  copydb: "正在搬迁数据库文件（界面暂时无响应）…",
+  startdb: "正在从新位置启动数据库…",
   db: "正在备份数据库…",
   done: "迁移完成",
   error: "迁移失败",
@@ -182,9 +187,9 @@ export default function StorageTab() {
       <div className="rounded border border-slate-200 p-3 space-y-2">
         <div className="text-[13px] font-medium text-slate-700">更换存储位置</div>
         <div className="flex items-center gap-2">
-          <input
+          <input autoComplete="off"
             className="flex-1 min-w-0 border rounded px-2 py-1.5 text-xs mono bg-white"
-            placeholder="选择一个新的空文件夹（如 D:\TraceData）"
+            placeholder="选择一个新的空文件夹（如 D:\TraceData 或 /mnt/data/TraceData）"
             value={target}
             onChange={(e) => setTarget(e.target.value)}
             disabled={running}
@@ -249,6 +254,13 @@ export default function StorageTab() {
 
         {!running && prog?.phase === "error" && prog.error && (
           <div className="text-[11px] text-rose-600">上次迁移失败：{prog.error}</div>
+        )}
+
+        {info?.moves_local_db && !running && (
+          <div className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1.5 leading-relaxed">
+            检测到内置数据库：迁移会先复制其余文件，再停库、搬迁数据库文件并自动从新位置启动。
+            停库期间界面会短暂无响应，完成后自动恢复。
+          </div>
         )}
 
         <p className="text-[11px] text-slate-400 leading-relaxed">

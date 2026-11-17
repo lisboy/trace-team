@@ -21,13 +21,6 @@ from game_agent.logging_setup import last_seq, log_file_path, snapshot_logs, tai
 router = APIRouter(prefix="/api", tags=["system"])
 
 
-@router.get("/system/media-queue")
-async def media_queue_status(ctx: RequestContext = Depends(require(PERM_VIEW))):
-    """媒体生成队列状态：当前是否有生成在跑、排了几个（图片/语音/视频共用）。"""
-    from game_agent.assets import media_queue
-    return media_queue.status()
-
-
 @router.get("/system/logs")
 async def get_logs(
     since: int = Query(0, ge=0),

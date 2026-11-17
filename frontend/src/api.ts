@@ -1,6 +1,7 @@
 import { useAuth } from "./store";
 
 const BASE = "/api";
+const TOKEN_KEY = "ga_token";
 
 class ApiError extends Error {
   status: number;
@@ -10,23 +11,74 @@ class ApiError extends Error {
   }
 }
 
-async function request<T = any>(path: string, opts: RequestInit = {}): Promise<T> {
+export function getToken(): string | null {
+  try {
+    return localStorage.getItem(TOKEN_KEY);
+  } catch {
+    return null;
+  }
+}
+
+export function setToken(token: string): void {
+  try {
+    localStorage.setItem(TOKEN_KEY, token);
+  } catch {
+    /* 隐私模式：本次会话内仍可用（内存里的 store.token 才是事实源） */
+  }
+}
+
+export function clearToken(): void {
+  try {
+    localStorage.removeItem(TOKEN_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
+/** 二进制 / 下载类请求用的头（<img> 带不了自定义头，那些地方走 blob 或签名 URL）。 */
+function authHeaders(extra: Record<string, string> = {}): Record<string, string> {
   const teamId = useAuth.getState().currentTeamId;
-  const headers = new Headers(opts.headers);
+  const headers: Record<string, string> = { ...extra };
+  if (teamId) headers["X-Team-Id"] = teamId;
+  const token = getToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  return headers;
+}
+
+interface RequestOpts extends RequestInit {
+  /** 登录接口 401 是「密码错误」，不该触发全局退出 */
+  handle401?: boolean;
+}
+
+async function request<T = any>(path: string, opts: RequestOpts = {}): Promise<T> {
+  const { handle401 = true, ...init } = opts;
+  const teamId = useAuth.getState().currentTeamId;
+  const headers = new Headers(init.headers);
   if (teamId) headers.set("X-Team-Id", teamId);
-  if (opts.body && !(opts.body instanceof FormData) && !headers.has("Content-Type")) {
+  const token = getToken();
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  if (init.body && !(init.body instanceof FormData) && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
-  const res = await fetch(BASE + path, { ...opts, headers });
+  const res = await fetch(BASE + path, { ...init, headers });
   if (!res.ok) {
     let msg = `${res.status}`;
+    let detail: any = null;
     try {
       const j = await res.json();
-      msg = j.detail || msg;
+      detail = j?.detail;
+      msg = detail?.message || detail || msg;
     } catch {
       /* ignore */
     }
-    throw new ApiError(msg, res.status);
+    if (detail?.code === "password_change_required") {
+      useAuth.getState().setMustChangePassword(true);
+      window.dispatchEvent(new Event("ga-password-required"));
+    } else if (res.status === 401 && handle401 && getToken()) {
+      useAuth.getState().clearAuth();
+      window.dispatchEvent(new Event("ga-unauthorized"));
+    }
+    throw new ApiError(String(msg), res.status);
   }
   if (res.status === 204) return null as T;
   const ct = res.headers.get("content-type") || "";
@@ -34,7 +86,19 @@ async function request<T = any>(path: string, opts: RequestInit = {}): Promise<T
 }
 
 export const api = {
-  // ---- 本机资料（没有登录：这里只是昵称/头像） ----
+  // ---- 登录 / 个人资料 ----
+  login: (username: string, password: string) =>
+    request<any>("/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+      handle401: false,
+    }),
+  logout: () => request("/auth/logout", { method: "POST", handle401: false }),
+  changePassword: (oldPassword: string, newPassword: string) =>
+    request("/auth/change-password", {
+      method: "POST",
+      body: JSON.stringify({ old_password: oldPassword, new_password: newPassword }),
+    }),
   me: () => request("/auth/me"),
   updateMe: (body: { display_name?: string; avatar?: string | null }) =>
     request<{ ok: boolean; user: any }>("/auth/me", { method: "PATCH", body: JSON.stringify(body) }),
@@ -43,6 +107,41 @@ export const api = {
     fd.append("file", file);
     return request<{ ok: boolean; avatar: string }>("/auth/me/avatar", { method: "POST", body: fd });
   },
+
+  // ---- 团队管理（仅管理员）----
+  teamMembers: () => request("/team/members"),
+  createMember: (body: {
+    username: string; display_name?: string; role: string;
+    password?: string; project_ids?: string[];
+  }) => request("/team/members", { method: "POST", body: JSON.stringify(body) }),
+  updateMember: (id: string, body: { display_name?: string; role?: string; is_active?: boolean }) =>
+    request(`/team/members/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+  resetMemberPassword: (id: string) =>
+    request(`/team/members/${id}/reset-password`, { method: "POST" }),
+  assignMemberProjects: (id: string, project_ids: string[]) =>
+    request(`/team/members/${id}/projects`, { method: "PUT", body: JSON.stringify({ project_ids }) }),
+  teamProjects: () => request("/team/projects"),
+  setProjectModel: (projectId: string, key: string | null) =>
+    request(`/team/projects/${projectId}/model`, {
+      method: "PUT", body: JSON.stringify({ model_profile_key: key }),
+    }),
+  /** 项目代码仓库：Git（地址/分支/令牌）或 SVN（地址/账号/密码） */
+  setProjectVcs: (projectId: string, body: {
+    vcs_type: "none" | "git" | "svn";
+    vcs_remote?: string; vcs_branch?: string; vcs_username?: string;
+    vcs_secret?: string | null;
+  }) => request(`/team/projects/${projectId}/vcs`, {
+    method: "PUT", body: JSON.stringify(body),
+  }),
+  /** 项目级并发上限：同时执行的 run 最多几个（0 = 不限） */
+  setProjectConcurrency: (projectId: string, maxConcurrency: number) =>
+    request(`/team/projects/${projectId}/concurrency`, {
+      method: "PUT", body: JSON.stringify({ max_concurrency: maxConcurrency }),
+    }),
+  /** 按当前配置立刻同步一次（验证地址/令牌是否可用，也会真的拉取） */
+  testProjectVcs: (projectId: string) =>
+    request(`/team/projects/${projectId}/vcs/test`, { method: "POST" }),
+  teamModelProfiles: () => request("/team/model-profiles"),
 
   // ---- teams / projects ----
   teams: () => request("/teams"),
@@ -61,11 +160,17 @@ export const api = {
   /** 目录浏览：新建工作区时选文件夹（lite 模式可浏览本机任意目录） */
   fsDirs: (path = "") =>
     request(`/fs/dirs${path ? `?path=${encodeURIComponent(path)}` : ""}`),
+  /** 在指定目录下新建空文件夹（内置目录浏览器用；迁移数据要求目标是空目录） */
+  fsMkdir: (parent: string, name: string) =>
+    request<{ path: string }>("/fs/mkdir", {
+      method: "POST",
+      body: JSON.stringify({ parent, name }),
+    }),
 
   // ---- sessions / runs ----
   sessions: (projectId: string, archived = false) =>
     request(`/projects/${projectId}/sessions?archived=${archived}`),
-  updateSession: (id: string, patch: { status?: "active" | "archived"; permission_scope?: "workspace" | "full" }) =>
+  updateSession: (id: string, patch: { status?: "active" | "archived" }) =>
     request(`/sessions/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),
   deleteSession: (id: string) => request(`/sessions/${id}`, { method: "DELETE" }),
   /** 会话消息。带 limit 时返回 {messages, has_more, oldest}（最近 limit 条 / 更早一页）；
@@ -82,8 +187,10 @@ export const api = {
   /** 该会话自己的 run 列表（新→旧）：不受「项目最近 50 条」窗口限制，
    *  老会话也能认出上一次执行是成功/失败，避免聊天页看起来一片空白 */
   sessionRuns: (sessionId: string) => request(`/sessions/${sessionId}/runs`),
-  /** 会话级用量：总 token / 缓存命中率 / 生成速度 */
+  /** 会话级用量：总 token / 缓存命中率 / 生成速度（**只算主对话**，不含子agent） */
   sessionUsage: (sessionId: string) => request(`/sessions/${sessionId}/usage`),
+  /** 本会话跑过的所有子agent 明细（运行面板「子agent」标签用；与主对话分开统计） */
+  sessionSubagents: (sessionId: string) => request(`/sessions/${sessionId}/subagents`),
   /** 上下文统计：请求构成占比、逐轮占用趋势、工具调用分布（runId 为空=整个会话） */
   contextStats: (sessionId: string, runId?: string | null) =>
     request(`/sessions/${sessionId}/context-stats${runId ? `?run_id=${runId}` : ""}`),
@@ -111,29 +218,22 @@ export const api = {
     request(`/runs/${runId}/tasks/${taskId}/cancel`, { method: "POST" }),
   // 插话：并进正在执行的那一轮（不取消任务、不新开 run）。图和附件与聊天发送同一套格式。
   // clientMsgId 是幂等键：连点/重试同一条插话时后端只落一条消息。
-  // 传 model 时顺带「运行中切换模型」：后端把这一轮后续的 LLM 换成新档位（下一轮生效）。
-  //   model.profile 空串 = 回到「跟随角色默认」；不传 model = 本次不动模型。
-  // 传 settings 时顺带「运行中改运行选项」：会话权限，下一轮生效。
+  // 模型由管理员按项目绑定（projects.model_profile_key），对话里不允许切换。
   steerRun: (
     id: string,
     content: string,
     images: string[] = [],
     files: { path: string; name: string; size: number }[] = [],
     clientMsgId = "",
-    model?: { profile: string; effort: string },
-    settings?: { permission_scope?: string },
   ) => request(`/runs/${id}/steer`, {
     method: "POST",
-    body: JSON.stringify({
-      content, images, files, client_msg_id: clientMsgId,
-      ...(model ? { model_profile_key: model.profile, reasoning_effort: model.effort } : {}),
-      ...(settings || {}),
-    }),
+    body: JSON.stringify({ content, images, files, client_msg_id: clientMsgId }),
   }),
 
   // ---- events / artifacts ----
-  events: (runId: string, since: number) =>
-    request(`/runs/${runId}/events?since=${since}`),
+  /** run 的事件流。taskId 非空时只回这个子agent 自己的事件（弹窗看对话详情用） */
+  events: (runId: string, since: number, taskId?: string | null) =>
+    request(`/runs/${runId}/events?since=${since}${taskId ? `&task_id=${taskId}` : ""}`),
   /** 计划机制：读取本轮待办清单（组长 update_plan 写入） */
   plan: (runId: string) => request(`/runs/${runId}/plan`),
   /** 提问机制：会话内的问题（待回答 + 已回答记录） */
@@ -164,22 +264,16 @@ export const api = {
   },
   /** 取二进制并转 blob: URL（取图用；失败抛错由调用方降级）。 */
   fetchBlobUrl: async (url: string): Promise<string> => {
-    const teamId = useAuth.getState().currentTeamId;
-    const headers = new Headers();
-    if (teamId) headers.set("X-Team-Id", teamId);
-    const res = await fetch(url, { headers });
+    const res = await fetch(url, { headers: authHeaders() });
     if (!res.ok) throw new ApiError(`${res.status}`, res.status);
     return URL.createObjectURL(await res.blob());
   },
   /** 从中断处继续上次任务（不是把上一条消息重发一次）。
-   *  model 传当前选择器里的档位：用户刚切过模型再点「继续」时以它为准（否则会回角色默认）。 */
-  continueRun: (runId: string, note?: string, model?: { profile: string; effort: string }) =>
+   *  模型跟项目绑定，继续时由后端按 projects.model_profile_key 解析。 */
+  continueRun: (runId: string, note?: string) =>
     request(`/runs/${runId}/continue`, {
       method: "POST",
-      body: JSON.stringify({
-        note: note || null,
-        ...(model ? { model_profile_key: model.profile, reasoning_effort: model.effort } : {}),
-      }),
+      body: JSON.stringify({ note: note || null }),
     }),
   /** 审阅不通过 → 回滚（paths 为空表示全部回滚） */
   revertRun: (runId: string, paths?: string[]) =>
@@ -190,9 +284,7 @@ export const api = {
   addComment: (runId: string, body: { body: string; file: string; line: number }) =>
     request(`/runs/${runId}/comments`, { method: "POST", body: JSON.stringify(body) }),
   resolveComment: (id: string) => request(`/comments/${id}/resolve`, { method: "POST" }),
-  /** 素材列表。不带 limit → 返回全部（轨迹块按 run_id 拉产物用）；
-   *  素材库带 limit 分页：before/before_id=(上页最后一条 created_at,id) 复合游标。
-   *  asset_kind/session_id 在服务端过滤（分页时必须服务端筛，否则只在已加载页里筛会像「素材变少」）。 */
+  /** 产物的通用列表接口（按 run / 项目 / 会话过滤）。 */
   artifacts: (params: {
     run_id?: string; project_id?: string; asset_kind?: string; session_id?: string;
     placeholder?: boolean; limit?: number; before?: string; before_id?: string;
@@ -208,26 +300,39 @@ export const api = {
     if (params.before_id) q.set("before_id", params.before_id);
     return request(`/artifacts?${q.toString()}`);
   },
-  artifactSessions: (projectId?: string) => {
-    const q = new URLSearchParams();
-    if (projectId) q.set("project_id", projectId);
-    const qs = q.toString();
-    return request(`/artifacts/session-sources${qs ? `?${qs}` : ""}`);
-  },
-  regenerate: (artifactId: string) =>
-    request(`/artifacts/${artifactId}/regenerate`, { method: "POST" }),
-  /** 删除单个素材（连同工作区文件与缩略图缓存） */
-  deleteArtifact: (artifactId: string) =>
-    request<{ ok: boolean; id: string }>(`/artifacts/${artifactId}`, { method: "DELETE" }),
-  /** 按当前筛选清空素材库（删记录 + 文件 + 缩略图）；返回实际删除条数 */
-  clearArtifacts: (body: {
-    project_id: string; asset_kind?: string; session_id?: string; placeholder?: boolean;
-  }) =>
-    request<{ ok: boolean; deleted: number }>("/artifacts/clear", {
-      method: "POST", body: JSON.stringify(body),
-    }),
   artifactFile: (artifactId: string, v?: string | number) =>
     `${BASE}/artifacts/${artifactId}/file?rv=2${v ? `&v=${v}` : ""}`,
+  /** 素材原图另存到本机：带鉴权头 fetch → blob → 触发浏览器另存，
+   *  文件名沿用素材路径的最后一段（直接用 <a download> 拿到的是接口地址和空名字，扩展名也不对）。 */
+  downloadArtifact: async (a: { id: string; rel_path?: string; size?: number | null }): Promise<void> => {
+    const res = await fetch(
+      `${BASE}/artifacts/${a.id}/file?rv=2${a.size ? `&v=${a.size}` : ""}`,
+      { headers: authHeaders() });
+    if (!res.ok) throw new ApiError(`下载失败 ${res.status}`, res.status);
+    const name = (a.rel_path || "").split("/").pop() || a.id;
+    const objUrl = URL.createObjectURL(await res.blob());
+    const el = document.createElement("a");
+    el.href = objUrl;
+    el.download = name;
+    document.body.appendChild(el);
+    el.click();
+    el.remove();
+    window.setTimeout(() => URL.revokeObjectURL(objUrl), 2000);
+  },
+  /** 素材原图转 dataURL（复制到剪贴板用：剪贴板不认相对路径，网页里又要能直接渲染出图） */
+  artifactDataUrl: async (a: { id: string; size?: number | null }): Promise<string> => {
+    const res = await fetch(
+      `${BASE}/artifacts/${a.id}/file?rv=2${a.size ? `&v=${a.size}` : ""}`,
+      { headers: authHeaders() });
+    if (!res.ok) throw new ApiError(`${res.status}`, res.status);
+    const blob = await res.blob();
+    return new Promise<string>((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(String(r.result || ""));
+      r.onerror = () => reject(new Error("读取图片失败"));
+      r.readAsDataURL(blob);
+    });
+  },
   /** 素材缩略图（长边 w）：列表/网格/消息附图都用它，点开大图才加载 artifactFile 原图。
    *  v 参数=内容版本（如重画后的 mtime），变了就破缓存。 */
   artifactThumb: (artifactId: string, w = 320, v?: string | number) =>
@@ -237,125 +342,15 @@ export const api = {
     request<{ run_script: string | null; stop_script: string | null }>(`/projects/${projectId}/scripts`),
   runProjectScript: (projectId: string, action: "run" | "stop") =>
     request<{ started: boolean; script: string; pid: number }>(`/projects/${projectId}/scripts/${action}`, { method: "POST" }),
-  // ---- AI 生图工作台 ----
-  imageGenOptions: () => request("/image-gen/options"),  imageGenStart: () => request("/image-gen/comfyui/start", { method: "POST" }),
-  imageGenStop: () => request("/image-gen/comfyui/stop", { method: "POST" }),
-  // 用默认对话模型根据用户输入补全正面/负面提示词
-  imageGenFillPrompts: (body: { user_input: string; current_positive?: string; current_negative?: string }) =>
-    request<{ positive: string; negative: string; note: string; model: string; elapsed_ms: number }>(
-      "/image-gen/fill-prompts", { method: "POST", body: JSON.stringify(body) }),
-  imageGenUpload: (file: File) => {
-    const fd = new FormData();
-    fd.append("file", file);
-    return request("/image-gen/reference", { method: "POST", body: fd });
-  },
-  // ---- 生图预设 / LoRA 管理 ----
-  imageGenPresets: () => request("/image-gen/presets"),
-  imageGenSavePreset: (body: { key?: string; label: string; params: Record<string, any>; image?: string }) =>
-    request("/image-gen/presets", { method: "POST", body: JSON.stringify(body) }),
-  imageGenPatchPreset: (id: string, body: { label?: string; params?: Record<string, any> }) =>
-    request(`/image-gen/presets/${id}`, { method: "PUT", body: JSON.stringify(body) }),
-  imageGenDeletePreset: (id: string) =>
-    request(`/image-gen/presets/${id}`, { method: "DELETE" }),
-  imageGenPresetImage: (name: string) =>
-    blobUrl(`/image-gen/presets/image/${encodeURIComponent(name)}`),
-  // 项目绑定「强制预设」：agent 工具生图时强制套用
-  imageGenProjectPreset: (projectId: string) =>
-    request(`/image-gen/project-preset?project_id=${encodeURIComponent(projectId)}`),
-  imageGenSetProjectPreset: (body: { project_id: string; preset_id: string }) =>
-    request("/image-gen/project-preset", { method: "PUT", body: JSON.stringify(body) }),
-  imageGenUploadLora: (file: File, subdir = "user") => {
-    const fd = new FormData();
-    fd.append("file", file);
-    fd.append("subdir", subdir);
-    return request("/image-gen/loras", { method: "POST", body: fd });
-  },
-  imageGen: (body: Record<string, any>) =>
-    request("/image-gen", { method: "POST", body: JSON.stringify(body) }),
-  imageGenJob: (jobId: string) =>
-    request(`/image-gen/jobs/${encodeURIComponent(jobId)}`),
-  imageGenBlob: async (name: string): Promise<string> => {
-    const teamId = useAuth.getState().currentTeamId;
-    const headers: Record<string, string> = {};
-    if (teamId) headers["X-Team-Id"] = teamId;
-    const res = await fetch(`${BASE}/image-gen/files/${encodeURIComponent(name)}`, { headers });
-    if (!res.ok) throw new ApiError(`加载结果失败 ${res.status}`);
-    return URL.createObjectURL(await res.blob());
-  },
-  // ---- 视频工作台（本地 ComfyUI · Wan2.2 TI2V 5B） ----
-  videoGenOptions: () => request("/video-gen/options"),
-  videoGenUpload: (file: File) => {
-    const fd = new FormData();
-    fd.append("file", file);
-    return request("/video-gen/reference", { method: "POST", body: fd });
-  },
-  videoGen: (body: Record<string, any>) =>
-    request("/video-gen", { method: "POST", body: JSON.stringify(body) }),
-  videoGenJob: (jobId: string) =>
-    request(`/video-gen/jobs/${encodeURIComponent(jobId)}`),
-  videoGenBlob: async (name: string): Promise<string> => {
-    const teamId = useAuth.getState().currentTeamId;
-    const headers: Record<string, string> = {};
-    if (teamId) headers["X-Team-Id"] = teamId;
-    const res = await fetch(`${BASE}/video-gen/files/${encodeURIComponent(name)}`, { headers });
-    if (!res.ok) throw new ApiError(`加载结果失败 ${res.status}`);
-    return URL.createObjectURL(await res.blob());
-  },
-  // ---- 语音工作台（IndexTTS2 本地服务） ----
-  voiceGenStatus: () => request("/voice-gen/status"),
-  voiceGenStart: () => request("/voice-gen/start", { method: "POST" }),
-  voiceGenStop: () => request("/voice-gen/stop", { method: "POST" }),
-  voiceGenUpload: (file: File) => {
-    const fd = new FormData();
-    fd.append("file", file);
-    return request("/voice-gen/upload", { method: "POST", body: fd });
-  },
-  voiceGen: (body: Record<string, any>) =>
-    request("/voice-gen", { method: "POST", body: JSON.stringify(body) }),
-  voiceGenJob: (jobId: string) =>
-    request(`/voice-gen/jobs/${encodeURIComponent(jobId)}`),
-  voiceGenBlob: (name: string) => blobUrl(`/voice-gen/files/${encodeURIComponent(name)}`),
-  voiceGenDesign: (body: { desc: string; say?: string; n?: number; enhance?: boolean }) =>
-    request("/voice-gen/design", { method: "POST", body: JSON.stringify(body) }),
-  voiceGenDesignBlob: (name: string) =>
-    blobUrl(`/voice-gen/design/files/${encodeURIComponent(name)}`),
-  voiceGenSavePreset: (body: { name: string; file: string; overwrite?: boolean }) =>
-    request("/voice-gen/presets", { method: "POST", body: JSON.stringify(body) }),
-  /** 上传一段现成音频，直接存成 IndexTTS2 音色预设（供 agent generate_audio 按名字复用） */
-  voiceGenUploadPreset: (file: File, body: {
-    name: string; emo_weight?: number; emo_text?: string;
-    emo_vector?: number[]; emo_audio?: File | null; overwrite?: boolean;
-  }) => {
-    const fd = new FormData();
-    fd.append("file", file);
-    fd.append("name", body.name);
-    if (body.emo_weight != null) fd.append("emo_weight", String(body.emo_weight));
-    if (body.emo_text) fd.append("emo_text", body.emo_text);
-    if (body.emo_vector && body.emo_vector.some((v) => v > 0)) fd.append("emo_vector", body.emo_vector.join(","));
-    if (body.emo_audio) fd.append("emo_audio", body.emo_audio);
-    if (body.overwrite) fd.append("overwrite", "true");
-    return request("/voice-gen/presets/upload", { method: "POST", body: fd });
-  },
-  /** 取某个预设的参考音频（试听网上传的音频，确认存对了） */
-  voiceGenPresetAudio: (name: string) =>
-    blobUrl(`/voice-gen/presets/${encodeURIComponent(name)}/audio`),
-
-  importAssets: (projectId: string, files: File[], kind: string) => {
-    const fd = new FormData();
-    files.forEach((f) => fd.append("files", f));
-    fd.append("kind", kind);
-    return request(`/projects/${projectId}/assets/import`, { method: "POST", body: fd });
-  },
-  fetchAssets: (projectId: string, body: { source_id: string; query: string; limit?: number }) =>
-    request(`/projects/${projectId}/assets/fetch`, { method: "POST", body: JSON.stringify(body) }),
   projectFileText: (projectId: string, path: string) =>
     request(`/projects/${projectId}/file?mode=text&path=${encodeURIComponent(path)}`),
   projectFileRaw: (projectId: string, path: string) =>
     `${BASE}/projects/${projectId}/file?mode=raw&path=${encodeURIComponent(path)}`,
 
-  // ---- 消息通道（钉钉 / 企业微信 / 自定义 Webhook）----
+  // ---- 消息通道（钉钉 / 企业微信 / 自定义 Webhook，按项目配置）----
   // 绑定已改为「直接填群机器人 Webhook」，不再有扫码 / code 接口。
-  channels: () => request("/channels"),
+  channels: (projectId?: string) =>
+    request(`/channels${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ""}`),
   channelBind: (channel: string, body: any) =>
     request(`/channels/${channel}/bind`, { method: "POST", body: JSON.stringify(body) }),
   unlinkChannel: (id: string) =>
@@ -364,7 +359,8 @@ export const api = {
     request(`/channels/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   testChannel: (id: string) =>
     request(`/channels/${id}/test`, { method: "POST" }),
-  channelMessages: (limit = 30) => request(`/channels/messages?limit=${limit}`),
+  channelMessages: (limit = 30, projectId?: string) =>
+    request(`/channels/messages?limit=${limit}${projectId ? `&project_id=${encodeURIComponent(projectId)}` : ""}`),
   saveChannelAppConfig: (body: any) =>
     request("/channels/app-config", { method: "POST", body: JSON.stringify(body) }),
 
@@ -397,16 +393,21 @@ export const api = {
     request(`/projects/${projectId}/mcp/${id}`, { method: "DELETE" }),
 
   // ---- config ----
-  agents: () => request("/agents"),
+  agents: (projectId = "") => request(`/agents${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ""}`),
   updateAgent: (key: string, body: any) =>
     request(`/agents/${key}`, { method: "PUT", body: JSON.stringify(body) }),
-  resetAgent: (key: string) => request(`/agents/${key}/reset`, { method: "POST" }),
-  modelProfiles: () => request("/model-profiles"),
+  resetAgent: (key: string, projectId = "") =>
+    request(`/agents/${key}/reset${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ""}`,
+      { method: "POST" }),
+  dropAgentOverride: (key: string, projectId: string) =>
+    request(`/agents/${key}/override?project_id=${encodeURIComponent(projectId)}`, { method: "DELETE" }),
+  modelProfiles: (projectId = "") =>
+    request(`/model-profiles${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ""}`),
   /** 选「供应商 → 模型」时复用/创建对话档位，返回 { key, created } */
-  autoModelProfile: (providerId: string, model: string) =>
+  autoModelProfile: (providerId: string, model: string, projectId = "") =>
     request("/model-profiles/auto", {
       method: "POST",
-      body: JSON.stringify({ provider_id: providerId, model }),
+      body: JSON.stringify({ provider_id: providerId, model, project_id: projectId || null }),
     }),
   createModelProfile: (body: any) =>
     request("/model-profiles", { method: "POST", body: JSON.stringify(body) }),
@@ -451,9 +452,13 @@ export const api = {
     request("/providers", { method: "POST", body: JSON.stringify(body) }),
   deleteProvider: (id: string) => request(`/providers/${id}`, { method: "DELETE" }),
 
-  // ---- 用量 / 审计（个人版：只统计自己的工作区）----
-  usage: (days = 30, agent?: string, model?: string) =>
-    request(`/usage?days=${days}${agent ? `&agent=${encodeURIComponent(agent)}` : ""}${model ? `&model=${encodeURIComponent(model)}` : ""}`),
+  // ---- 用量 / 审计（按当前工作区统计）----
+  usage: (days = 30, agent?: string, model?: string,
+          projectId?: string, userId?: string) =>
+    request(`/usage?days=${days}${agent ? `&agent=${encodeURIComponent(agent)}` : ""}`
+      + `${model ? `&model=${encodeURIComponent(model)}` : ""}`
+      + `${projectId ? `&project_id=${encodeURIComponent(projectId)}` : ""}`
+      + `${userId ? `&user_id=${encodeURIComponent(userId)}` : ""}`),
   audit: (limit = 50, q?: string) =>
     request(`/audit?limit=${limit}${q ? `&q=${encodeURIComponent(q)}` : ""}`),
 
@@ -496,7 +501,7 @@ export const api = {
 
   // ---- 助手行为：默认权限作用域 + 指导项 ----
   assistantPolicy: () => request("/assistant-policy"),
-  saveAssistantPolicy: (body: { permission_scope?: "workspace" | "full"; guidance?: any[] }) =>
+  saveAssistantPolicy: (body: { guidance?: any[] }) =>
     request("/assistant-policy", { method: "PUT", body: JSON.stringify(body) }),
   uploadWallpaper: (file: File) => {
     const fd = new FormData();
@@ -529,10 +534,8 @@ export const api = {
 
   // ---- 会话导出（zip：conversation.md + session.json）----
   /** 带鉴权头 fetch → blob → 触发浏览器另存；文件名优先取后端 Content-Disposition */
-  exportSession: async (sessionId: string, title: string): Promise<void> => {    const teamId = useAuth.getState().currentTeamId;
-    const headers: Record<string, string> = {};
-    if (teamId) headers["X-Team-Id"] = teamId;
-    const res = await fetch(`${BASE}/sessions/${sessionId}/export`, { headers });
+  exportSession: async (sessionId: string, title: string): Promise<void> => {
+    const res = await fetch(`${BASE}/sessions/${sessionId}/export`, { headers: authHeaders() });
     // 未知路由会被 SPA 兜底接住返回 200 HTML——下载下来就是个假 zip，必须拦
     const ct = res.headers.get("content-type") || "";
     if (!res.ok || !ct.includes("application/zip")) {
@@ -562,10 +565,7 @@ export { ApiError };
  * 浏览器原生标签带不上 Authorization，只能先 fetch 再给 blob URL。
  */
 async function blobUrl(path: string): Promise<string> {
-  const teamId = useAuth.getState().currentTeamId;
-  const headers: Record<string, string> = {};
-  if (teamId) headers["X-Team-Id"] = teamId;
-  const res = await fetch(BASE + path, { headers });
+  const res = await fetch(BASE + path, { headers: authHeaders() });
   if (!res.ok) throw new ApiError(`加载文件失败 ${res.status}`);
   return URL.createObjectURL(await res.blob());
 }

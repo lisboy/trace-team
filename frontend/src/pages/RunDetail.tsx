@@ -146,7 +146,7 @@ function DiffReview({ runId, focusFile, onFocused }: {
                         ))}
                         {target && target.file === f.file && target.line === (l.new_no ?? 0) && (
                           <div className="ml-12 mr-3 my-1 flex gap-2">
-                            <input autoFocus className="flex-1 border rounded px-2 py-1 text-xs"
+                            <input autoComplete="off" autoFocus className="flex-1 border rounded px-2 py-1 text-xs"
                               placeholder="输入评论后回车"
                               ref={inputRef}
                               defaultValue=""
@@ -364,7 +364,7 @@ export default function RunDetail({ runId, initialFile, initialAsset }: {
           </ul>
           {cr.has_placeholder && (
             <div className="mt-2 text-xs text-orange-600">
-              ⚠ 含 {cr.placeholder_count} 个占位素材，需在「素材库」配置供应商后重画。
+              ⚠ 含 {cr.placeholder_count} 个占位素材，请让管理员检查项目绑定的模型配置后重试。
             </div>
           )}
         </section>

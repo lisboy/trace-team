@@ -134,15 +134,21 @@ export const usePrefs = create<PrefsState>((set, get) => ({
 }));
 
 /** 登录后调用：拉取服务端偏好（有则覆盖本地），主题系统跟随也要监听系统切换 */
+let themeInited = false;
 export async function initTheme(): Promise<void> {
   apply(usePrefs.getState().prefs);
-  window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
-    const p = usePrefs.getState().prefs;
-    if (p.theme === "system") apply(p);
-  });
+  if (!themeInited) {
+    themeInited = true;
+    window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+      const p = usePrefs.getState().prefs;
+      if (p.theme === "system") apply(p);
+    });
+  }
   try {
+    // 外观按账号存在 users.prefs_json：换账号时用服务端口径覆盖本地缓存，
+    // 新账号没有偏好就回默认，避免沿用上一个账号的主题。
     const r = await api.mePrefs();
-    if (r?.prefs && Object.keys(r.prefs).length) usePrefs.getState().replace(r.prefs, true);
+    if (r) usePrefs.getState().replace(r.prefs || {}, true);
   } catch {
     /* 未登录 */
   }
